@@ -1,6 +1,9 @@
-# Magic V2Ray v1.28.1 Release Notes
+# Magic V2Ray v1.28.2 Release Notes
 
 An urgent core security update alongside targeted routing and control fixes.
+
+The Network settings Save action now survives a cached older WebView bundle,
+and reports write failures instead of claiming that settings were saved.
 
 Network-mode lifecycle handling now stops the proxy when the selected network
 is inactive, prevents upstream policy rules from being installed before a

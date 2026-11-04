@@ -48,6 +48,7 @@ acquire_service_lock() {
         for f in /proc/[0-9]*/cmdline; do
             pid=${f#/proc/}
             pid=${pid%/cmdline}
+            [ "$pid" = "$$" ] && continue
             cmd=$(tr '\0' ' ' < "$f" 2>/dev/null)
             case "$cmd" in
                 *"/data/adb/modules/magic_v2ray/service.sh"*)
@@ -306,14 +307,17 @@ TARGET_WAIT_TIMEOUT=60
 # 2. Settings helpers
 # ===========================================================================
 
-# Decode the settings file. Current WebUI builds store one base64 layer because
-# writeFileB64() owns the encoding; older builds accidentally stored two. Keep
-# the fallback so an upgrade does not reset network settings before the UI has
-# a chance to rewrite them.
+# Decode the settings file. writeFileB64() uses base64 only as a safe shell
+# transport and stores decoded JSON; older builds stored one or two encoded
+# layers. Accept all three formats so an upgrade never resets network settings.
 decode_settings() {
     local settings_file="$DATADIR/settings.base64" decoded
     [ -f "$settings_file" ] || return 1
-    decoded=$(base64 -d "$settings_file" 2>/dev/null) || return 1
+    decoded=$(cat "$settings_file" 2>/dev/null) || return 1
+    case "$decoded" in
+        \{*) printf '%s\n' "$decoded"; return 0 ;;
+    esac
+    decoded=$(printf '%s' "$decoded" | base64 -d 2>/dev/null) || return 1
     case "$decoded" in
         \{*) printf '%s\n' "$decoded" ;;
         *) printf '%s' "$decoded" | base64 -d 2>/dev/null || return 1 ;;

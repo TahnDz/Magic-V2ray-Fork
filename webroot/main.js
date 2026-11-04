@@ -486,6 +486,14 @@ function loadState(callback) {
     const parseStoredJson = (raw, fallback) => {
         const text = (raw || '').trim();
         if (!text) return fallback;
+        // writeFileB64 uses base64 only as a safe transport for the shell and
+        // writes the decoded JSON to disk. Accept that current format first.
+        try {
+            const direct = JSON.parse(text);
+            if (direct && typeof direct === 'object') return direct;
+        } catch (directError) {
+            // Continue with the legacy encoded formats below.
+        }
         try {
             return JSON.parse(decodeBase64(text));
         } catch (firstError) {
@@ -3701,7 +3709,12 @@ function saveAdvancedSettingsForm(isLangOnly = false) {    advSettings.loglevel 
     // advSettings.lang is only written by changeLanguage() (explicit choice);
     // persisting currentLang here would turn auto-detection into a fixed choice.
 
-    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), (_output, stderr, errno) => {
+        if (errno) {
+            console.error('[saveAdvancedSettingsForm] settings write failed', stderr);
+            showToast(stderr || t('toast_settings_save_failed'), 'error');
+            return;
+        }
         if (isLangOnly) return;
         showToast(t('toast_settings_saved'), "success");
         // Nothing on this form is read by apply_routing_rules, so the
@@ -3732,18 +3745,43 @@ async function resetTrafficSettings() {
 // Only touches its own fields on advSettings; everything else already lives
 // in memory from the last load/save of the Traffic form.
 function saveNetworkSettingsForm() {
-    advSettings.networkMode = parseInt(document.getElementById('set-networkmode').value) || 0;
-    advSettings.mobileDataSubId = sanitizeMobileDataSubId(document.getElementById('set-mobile-data-subid').value);
-    advSettings.upstreamIface = sanitizeUpstreamIface(document.getElementById('set-upstreamiface').value);
-    advSettings.enableIPv6 = document.getElementById('set-enableipv6').checked;
-    advSettings.enableIPv6ULA = document.getElementById('set-enableipv6ula').checked;
-    advSettings.allowTether = document.getElementById('set-allowtether').checked;
-    advSettings.bypassVpnService = document.getElementById('set-bypassvpn').checked;
-    advSettings.lanProxyCidrs = collectLanProxyCidrs();
+    const mode = document.getElementById('set-networkmode');
+    const mobileSubId = document.getElementById('set-mobile-data-subid');
+    const upstream = document.getElementById('set-upstreamiface');
+    const ipv6 = document.getElementById('set-enableipv6');
+    const ipv6Ula = document.getElementById('set-enableipv6ula');
+    const tether = document.getElementById('set-allowtether');
+    const bypassVpn = document.getElementById('set-bypassvpn');
+
+    // Keep values loaded from disk when a cached/older WebView is missing a
+    // field added by a newer HTML bundle. A missing element must not abort the
+    // save before writeFileB64() is reached, nor erase the stored setting.
+    if (mode) advSettings.networkMode = parseInt(mode.value, 10) || 0;
+    advSettings.mobileDataSubId = sanitizeMobileDataSubId(
+        mobileSubId ? mobileSubId.value : advSettings.mobileDataSubId
+    );
+    if (upstream) advSettings.upstreamIface = sanitizeUpstreamIface(upstream.value);
+    if (ipv6) advSettings.enableIPv6 = ipv6.checked;
+    if (ipv6Ula) advSettings.enableIPv6ULA = ipv6Ula.checked;
+    if (tether) advSettings.allowTether = tether.checked;
+    if (bypassVpn) advSettings.bypassVpnService = bypassVpn.checked;
+    if (document.getElementById('lan-bypass-list')) {
+        advSettings.lanProxyCidrs = collectLanProxyCidrs();
+    }
     delete advSettings.includeLan;
 
-    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
-        applyBypassIfaceForm(() => {
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), (_output, stderr, errno) => {
+        if (errno) {
+            console.error('[saveNetworkSettingsForm] settings write failed', stderr);
+            showToast(stderr || t('toast_settings_save_failed'), 'error');
+            return;
+        }
+        applyBypassIfaceForm((_output, bypassStderr, bypassErrno) => {
+            if (bypassErrno) {
+                console.error('[saveNetworkSettingsForm] bypass list write failed', bypassStderr);
+                showToast(bypassStderr || t('toast_settings_save_failed'), 'error');
+                return;
+            }
             showToast(t('toast_settings_saved'), "success");
             applyActiveConfig({ force: true });
         });
@@ -3976,7 +4014,11 @@ function applyBypassIfaceForm(callback) {
         return;
     }
 
-    execShell(`mkdir -p ${shQuote(DATADIR)} && chmod 700 ${shQuote(DATADIR)}`, () => {
+    execShell(`mkdir -p ${shQuote(DATADIR)} && chmod 700 ${shQuote(DATADIR)}`, (output, stderr, errno) => {
+        if (errno) {
+            done(output, stderr, errno);
+            return;
+        }
         writeFileB64(BYPASS_IFACE_FILE, list.join(','), done);
     });
 }

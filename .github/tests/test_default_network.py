@@ -136,10 +136,14 @@ class SettingsDecodeTests(unittest.TestCase):
         cls.decoder = function("decode_settings")
         cls.query = function("query_settings")
 
-    def query_mode(self, payload, double_encoded=False):
-        encoded = base64.b64encode(payload.encode())
-        if double_encoded:
+    def query_mode(self, payload, storage="base64"):
+        encoded = payload.encode()
+        if storage == "base64":
             encoded = base64.b64encode(encoded)
+        elif storage == "double-base64":
+            encoded = base64.b64encode(base64.b64encode(encoded))
+        elif storage != "plain":
+            raise ValueError(storage)
         with tempfile.TemporaryDirectory() as data_dir:
             Path(data_dir, "settings.base64").write_bytes(encoded)
             script = (
@@ -157,11 +161,14 @@ class SettingsDecodeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout.strip()
 
-    def test_current_settings_decode_once(self):
+    def test_plain_json_settings_are_read(self):
+        self.assertEqual(self.query_mode('{"networkMode":2}', storage="plain"), "2")
+
+    def test_legacy_base64_settings_are_read(self):
         self.assertEqual(self.query_mode('{"networkMode":2}'), "2")
 
     def test_legacy_double_encoded_settings_are_read(self):
-        self.assertEqual(self.query_mode('{"networkMode":2}', double_encoded=True), "2")
+        self.assertEqual(self.query_mode('{"networkMode":2}', storage="double-base64"), "2")
 
 
 if __name__ == "__main__":
