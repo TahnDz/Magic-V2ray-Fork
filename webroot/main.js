@@ -3645,6 +3645,7 @@ function bindSettingsToFormView() {
 
     document.getElementById('set-mtu').value = advSettings.mtu || 1350;
     document.getElementById('set-networkmode').value = advSettings.networkMode ?? 0;
+    refreshMobileDataSimOptions(advSettings.mobileDataSubId);
     refreshUpstreamIfaceOptions(advSettings.upstreamIface);
     document.getElementById('set-allowtether').checked = advSettings.allowTether !== false;
     document.getElementById('set-bypassvpn').checked = advSettings.bypassVpnService !== false;
@@ -3732,6 +3733,7 @@ async function resetTrafficSettings() {
 // in memory from the last load/save of the Traffic form.
 function saveNetworkSettingsForm() {
     advSettings.networkMode = parseInt(document.getElementById('set-networkmode').value) || 0;
+    advSettings.mobileDataSubId = sanitizeMobileDataSubId(document.getElementById('set-mobile-data-subid').value);
     advSettings.upstreamIface = sanitizeUpstreamIface(document.getElementById('set-upstreamiface').value);
     advSettings.enableIPv6 = document.getElementById('set-enableipv6').checked;
     advSettings.enableIPv6ULA = document.getElementById('set-enableipv6ula').checked;
@@ -3746,6 +3748,55 @@ function saveNetworkSettingsForm() {
             applyActiveConfig({ force: true });
         });
     });
+}
+
+// ===== Mobile data SIM filter =====
+// This selects which subscription id is allowed to trigger Mobile Data Only.
+// It does not change Android's default data SIM; the system remains in charge
+// of telephony selection and the service simply ignores other rmnet links.
+function sanitizeMobileDataSubId(raw) {
+    const value = String(raw || '').trim().toLowerCase();
+    return value === 'auto' || !value ? 'auto' : (/^\d{1,10}$/.test(value) ? value : 'auto');
+}
+
+function refreshMobileDataSimOptions(selected) {
+    const select = document.getElementById('set-mobile-data-subid');
+    if (!select) return;
+    const want = sanitizeMobileDataSubId(selected);
+    const build = (entries) => {
+        select.innerHTML = '';
+        const auto = document.createElement('option');
+        auto.value = 'auto';
+        auto.textContent = t('mobile_sim_auto');
+        select.appendChild(auto);
+        const seen = new Set();
+        entries.forEach(({ slot, subId }) => {
+            if (seen.has(subId)) return;
+            seen.add(subId);
+            const option = document.createElement('option');
+            option.value = subId;
+            option.textContent = `SIM ${Number(slot) + 1} (subId ${subId})`;
+            select.appendChild(option);
+        });
+        if (want !== 'auto' && !seen.has(want)) {
+            const option = document.createElement('option');
+            option.value = want;
+            option.textContent = `subId ${want}`;
+            select.appendChild(option);
+        }
+        select.value = want;
+    };
+
+    execShell(
+        `dumpsys isub 2>/dev/null | sed -n 's/.*Logical SIM slot \\([0-9][0-9]*\\): subId=\\([0-9][0-9]*\\).*/\\1 \\2/p'`,
+        (output) => {
+            const entries = (output || '').split('\n').map(line => {
+                const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+                return m ? { slot: m[1], subId: m[2] } : null;
+            }).filter(Boolean);
+            build(entries);
+        }
+    );
 }
 
 // ===== Upstream network interface =====

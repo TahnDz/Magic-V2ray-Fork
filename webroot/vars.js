@@ -101,6 +101,9 @@ let advSettings = {
     // see resolveDnsQueryStrategy() in helper.js for the migration.
     queryStrategy: "UseIPv4",
     networkMode: 0,
+    // Network tab, Mobile Data Only filter. "auto" follows Android's active
+    // data subscription; a numeric value selects that subscription id.
+    mobileDataSubId: "auto",
     allowTether: true,
     // Network tab, "Bypass VpnService". true (default): traffic headed to other
     // apps' VPN tunnels (tun0, tun1, ... = VPN_IFACE_PATTERN) skips Xray, so

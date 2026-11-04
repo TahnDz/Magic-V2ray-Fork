@@ -25,6 +25,47 @@ DATADIR="/data/adb/magic_v2ray"
 STUB_DIR=/dev/sysctl_stubs
 CONFIG_NAME=config.v2.json
 
+# The service may be started more than once by a root manager after a module
+# refresh. All instances share one FIFO and one policy-routing namespace; two
+# readers split commands into fragments (for example `stop_onitr_ltecy`). Use
+# an atomic directory lock and keep it while any service process remains.
+SERVICE_LOCK_DIR="$DATADIR/service.lock"
+SERVICE_LOCK_PID="$SERVICE_LOCK_DIR/pid"
+
+acquire_service_lock() {
+    local attempt f pid cmd
+    mkdir -p "$DATADIR"
+    chmod 700 "$DATADIR" 2>/dev/null
+    for attempt in 1 2 3 4 5; do
+        if mkdir "$SERVICE_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$SERVICE_LOCK_PID"
+            return 0
+        fi
+
+        # A previous shell may have exited while its control child remains;
+        # inspect command lines before declaring the lock stale.
+        for f in /proc/[0-9]*/cmdline; do
+            pid=${f#/proc/}
+            pid=${pid%/cmdline}
+            cmd=$(tr '\0' ' ' < "$f" 2>/dev/null)
+            case "$cmd" in
+                *"/data/adb/modules/magic_v2ray/service.sh"*)
+                    echo "magic_v2ray service already running (pid $pid)" >&2
+                    return 1
+                    ;;
+            esac
+        done
+
+        unlink "$SERVICE_LOCK_PID" 2>/dev/null || true
+        unlink "$SERVICE_LOCK_DIR/version" 2>/dev/null || true
+        rmdir "$SERVICE_LOCK_DIR" 2>/dev/null || sleep 0.1
+    done
+    echo "could not acquire magic_v2ray service lock" >&2
+    return 1
+}
+
+acquire_service_lock || exit 0
+
 # ===========================================================================
 # 1. Paths, constants, logging
 # ===========================================================================
@@ -258,6 +299,7 @@ PLAIN_POOL_PORT="80"
 # UI heartbeat. See monitor_network_latency().
 LATENCY_INTERVAL=2
 LATENCY_HB_TIMEOUT=15
+TARGET_WAIT_TIMEOUT=60
 
 # ===========================================================================
 # 2. Settings helpers
@@ -357,7 +399,28 @@ umount_proc_with_name() {
 }
 
 is_proc_running() {
-    [ -e "$PROC_DIR/$1/exe" ]
+    local name="$1" pid exe cmdline
+    [ -e "$PROC_DIR/$name/exe" ] && return 0
+    [ "$name" = xray ] || return 1
+
+    # Some Android kernels reject the /proc bind mount even for root. Fall
+    # back to the pid file so network-mode reconciliation still sees the live
+    # Xray process and can stop it when Wi-Fi replaces mobile data.
+    pid="${XRAY_PID:-}"
+    if [ "$pid" -le 0 ] 2>/dev/null || [ ! -d "/proc/$pid" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+    fi
+    [ "$pid" -gt 0 ] 2>/dev/null || return 1
+    [ -d "/proc/$pid" ] || return 1
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    case "$exe" in
+        */xray|*/xray\ \(deleted\)) return 0 ;;
+    esac
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    case "$cmdline" in
+        *"/magic_v2ray/bin/xray"*) return 0 ;;
+    esac
+    return 1
 }
 
 # Kills a tracked process and drops its /proc bind mount.
@@ -417,8 +480,48 @@ detect_auto_table() {
 # netd names each network's routing table after its interface, so the table
 # name from the rule is the interface name. If `ip` printed a bare number
 # instead (name not resolved), map it back through rt_tables.
+get_connectivity_active_interface() {
+    local net_id
+    net_id=$(/system/bin/dumpsys connectivity 2>/dev/null \
+        | sed -n 's/^Active default network: \([0-9][0-9]*\)$/\1/p' \
+        | head -n 1)
+    [ -n "$net_id" ] || return 1
+
+    /system/bin/dumpsys connectivity 2>/dev/null \
+        | awk -v id="$net_id" '
+            index($0, "NetworkAgentInfo{network{" id "}") { capture=1 }
+            capture {
+                pos=index($0, "InterfaceName: ")
+                if (pos) {
+                    value=substr($0, pos + 15)
+                    sub(/[[:space:]].*/, "", value)
+                    print value
+                    exit
+                }
+            }
+            capture && /^  NetworkAgentInfo/ && index($0, "NetworkAgentInfo{network{" id "}") == 0 { exit }
+        ' \
+        | head -n 1
+}
+
 get_active_interface() {
-    local tbl iface="" index name
+    local connectivity_iface tbl iface="" index name
+
+    # Android's connectivity service is authoritative during handovers. The
+    # kernel rule list may retain the previous network for a few seconds, and
+    # `ip route get` can therefore report a stale cellular table while Wi-Fi is
+    # already the validated default (or the reverse).
+    connectivity_iface=$(get_connectivity_active_interface)
+    case "$connectivity_iface" in
+        *[!A-Za-z0-9_.-]*|'') ;;
+        *)
+            [ "$connectivity_iface" != "$TUN_NAME" ] && {
+                echo "$connectivity_iface"
+                return 0
+            }
+            ;;
+    esac
+
     tbl=$(detect_auto_table)
     [ -n "$tbl" ] || return 1
 
@@ -496,7 +599,7 @@ get_upstream_interface() {
     case "$want" in
         ''|auto) UPSTREAM_WARNED=""; get_active_interface; return $? ;;
         *[!A-Za-z0-9_.-]*)
-            [ "$UPSTREAM_WARNED" = "$want" ] || log "upstream interface: invalid name, using auto"
+            [ "$UPSTREAM_WARNED" = "$want" ] || log "upstream interface: invalid name, using auto" >&2
             UPSTREAM_WARNED="$want"
             get_active_interface; return $?
             ;;
@@ -508,7 +611,7 @@ get_upstream_interface() {
         return 0
     fi
     # Log once per distinct name, not on every route event.
-    [ "$UPSTREAM_WARNED" = "$want" ] || log "upstream interface $want unavailable, falling back to auto"
+    [ "$UPSTREAM_WARNED" = "$want" ] || log "upstream interface $want unavailable, falling back to auto" >&2
     UPSTREAM_WARNED="$want"
     get_active_interface
 }
@@ -566,6 +669,28 @@ is_mobile_data_iface() {
     esac
 }
 
+# Android's network agent includes the subscription id that owns each mobile
+# interface. This lets the Network tab select SIM 1/2 without writing Android's
+# telephony settings or forcing a data-SIM switch behind the user's back.
+mobile_iface_sub_id() {
+    local iface="$1"
+    /system/bin/dumpsys connectivity 2>/dev/null \
+        | grep -F "InterfaceName: $iface " \
+        | sed -n 's/.*mSubId = \([0-9][0-9]*\).*/\1/p' \
+        | head -n 1
+}
+
+mobile_iface_matches_selected_sub() {
+    local iface="$1" selected actual
+    selected="$(query_settings mobileDataSubId 2>/dev/null)"
+    case "$selected" in
+        ''|auto) return 0 ;;
+        *[!0-9]*) return 1 ;;
+    esac
+    actual=$(mobile_iface_sub_id "$iface")
+    [ -n "$actual" ] && [ "$actual" = "$selected" ]
+}
+
 # Whether the selected Network-tab mode permits traffic on the system's
 # current default interface. An absent interface means netd has not completed
 # the handover yet; keep Xray stopped until a usable network is published.
@@ -578,7 +703,10 @@ network_mode_allows_interface() {
             if is_mobile_data_iface "$iface"; then return 1; fi
             return 0
             ;;
-        2) is_mobile_data_iface "$iface" ;;
+        2)
+            is_mobile_data_iface "$iface" || return 1
+            mobile_iface_matches_selected_sub "$iface"
+            ;;
         *) return 0 ;;
     esac
 }
@@ -588,6 +716,50 @@ network_mode_allows_active() {
     active=$(get_active_interface) || return 1
     interface_has_usable_route "$active" || return 1
     network_mode_allows_interface "$active"
+}
+
+# Extract the first real remote address from the generated config. Plain-VLESS
+# entries use a loopback dokodemo-door hop, so skip local/TUN addresses and use
+# the tunnel's actual destination instead.
+proxy_target_from_config() {
+    [ -s "$DATADIR/$CONFIG_NAME" ] || return 1
+    sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$DATADIR/$CONFIG_NAME" 2>/dev/null \
+        | while read -r target; do
+            case "$target" in
+                ''|localhost|127.*|198.18.*|198.19.*|fdfe:*|2001:db8:*) continue ;;
+                *) echo "$target"; break ;;
+            esac
+        done
+}
+
+# Wait for the selected network to be able to reach the proxy endpoint before
+# creating xraytun0 or installing any policy route. This keeps Android's own
+# handover free to complete while the action is pending.
+wait_for_proxy_target() {
+    local target started now elapsed
+    target=$(proxy_target_from_config)
+    [ -n "$target" ] || return 0
+
+    started=$(date +%s)
+    log "waiting up to ${TARGET_WAIT_TIMEOUT}s for proxy target $target"
+    while :; do
+        if ! network_mode_allows_active; then
+            log "proxy target wait cancelled: active network is no longer eligible"
+            return 1
+        fi
+        if /system/bin/ping -c 1 -W 1 -w 2 "$target" >/dev/null 2>&1; then
+            log "proxy target reachable: $target"
+            return 0
+        fi
+        now=$(date +%s)
+        elapsed=$((now - started))
+        [ "$elapsed" -ge "$TARGET_WAIT_TIMEOUT" ] && break
+        [ $((elapsed % 10)) -eq 0 ] && log "proxy target still unreachable after ${elapsed}s: $target"
+        sleep 2
+    done
+    log "proxy target did not become reachable within ${TARGET_WAIT_TIMEOUT}s: $target"
+    return 1
 }
 
 # Ask the command loop to reconcile the engine from the parent shell. The
@@ -600,7 +772,7 @@ request_network_reconcile() {
     if ! is_proc_running "xray" && [ ! -f "$NETWORK_PAUSED_FLAG" ]; then
         return 0
     fi
-    printf '%s\n' network_sync > "$PIPE_FILE"
+    timeout 2 sh -c "printf '%s\\n' network_sync > '$PIPE_FILE'" 2>/dev/null || true
 }
 
 # Hunter state. Previously every mismatch fired another radio restart with no
@@ -1870,6 +2042,11 @@ start_xray() {
         log "proxy paused: active network is outside the selected network mode"
         return 0
     fi
+    if ! wait_for_proxy_target; then
+        touch "$ENABLED_FLAG" "$NETWORK_PAUSED_FLAG"
+        remove_mark_rule
+        return 0
+    fi
     rm -f "$NETWORK_PAUSED_FLAG"
 
     # openxtun opens /dev/net/tun, ioctl(TUNSETIFF) into $TUN_NAME, sets
@@ -2012,10 +2189,17 @@ do_job() {
         network_sync)
             if [ -f "$ENABLED_FLAG" ]; then
                 if network_mode_allows_active; then
-                    rm -f "$NETWORK_PAUSED_FLAG"
                     if is_proc_running "xray"; then
-                        refresh_mark_rule
+                        # The interface monitor already re-pins on an
+                        # upstream change. Avoid deleting/re-adding the rule
+                        # for every route event; that feedback loop can keep
+                        # netd busy during a cellular handover.
+                        if [ -f "$NETWORK_PAUSED_FLAG" ]; then
+                            rm -f "$NETWORK_PAUSED_FLAG"
+                            refresh_mark_rule
+                        fi
                     else
+                        rm -f "$NETWORK_PAUSED_FLAG"
                         log "network mode now allows proxy; resuming engine"
                         start_xray
                     fi

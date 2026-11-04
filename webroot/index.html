@@ -306,6 +306,12 @@
                         </select>
                     </div>
                     <div class="setting-item-row">
+                        <label for="set-mobile-data-subid"><span data-i18n="lbl_mobile_data_sim">Mobile data SIM</span><small data-i18n="desc_mobile_data_sim">Only trigger the proxy for this SIM's active data interface. Auto follows Android's default data SIM.</small></label>
+                        <select id="set-mobile-data-subid">
+                            <option value="auto" data-i18n="mobile_sim_auto">Auto (Android default)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item-row">
                         <label for="set-upstreamiface"><span data-i18n="lbl_upstreamiface">Upstream network interface</span><small data-i18n="desc_upstreamiface">Network interface Xray itself connects out through. Auto follows the system's active network.</small></label>
                         <select id="set-upstreamiface">
                             <option value="auto" data-i18n="upstream_iface_auto">Auto</option>

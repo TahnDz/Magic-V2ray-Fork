@@ -77,6 +77,22 @@ get_status() {
             echo "running"
             return 0
         fi
+        # Some Android kernels reject the service's /proc bind mount even for
+        # root. Fall back to the pid file so the UI cannot start duplicate
+        # Xray processes while the real engine is already alive.
+        if [ -f "$RUN_DIR/xray.pid" ]; then
+            local pid cmdline
+            pid=$(cat "$RUN_DIR/xray.pid" 2>/dev/null)
+            if [ "$pid" -gt 0 ] 2>/dev/null && [ -d "/proc/$pid" ]; then
+                cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+                case "$cmdline" in
+                    *"/magic_v2ray/bin/xray"*)
+                        echo "running"
+                        return 0
+                        ;;
+                esac
+            fi
+        fi
         # Tracked but gone: the process crashed or exited unexpectedly and its
         # bind mount has not been torn down yet.
         echo "crashed"

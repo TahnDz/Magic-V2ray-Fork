@@ -80,19 +80,24 @@ class NetworkModeTests(unittest.TestCase):
             return source[start:end]
 
         cls.mobile_detector = function("is_mobile_data_iface")
+        cls.sub_filter = function("mobile_iface_matches_selected_sub")
         cls.mode_detector = function("network_mode_allows_interface")
 
-    def allows(self, mode, iface):
+    def allows(self, mode, iface, selected_sub="auto"):
         script = (
-            "query_settings() { printf '%s\\n' \"$NETWORK_MODE\"; }\n"
+            "query_settings() { case \"$1\" in networkMode) printf '%s\\n' \"$NETWORK_MODE\" ;; mobileDataSubId) printf '%s\\n' \"$MOBILE_SUB\" ;; esac; }\n"
             + self.mobile_detector
             + "\n"
+            + self.sub_filter
+            + "\n"
+            + "mobile_iface_sub_id() { case \"$1\" in rmnet_data1) printf '4\\n' ;; rmnet_data2) printf '1\\n' ;; *) printf '\\n' ;; esac; }\n"
             + self.mode_detector
             + "\nnetwork_mode_allows_interface \"$TEST_IFACE\"\n"
         )
         env = os.environ.copy()
         env["NETWORK_MODE"] = str(mode)
         env["TEST_IFACE"] = iface
+        env["MOBILE_SUB"] = selected_sub
         return subprocess.run(
             [shutil.which("sh"), "-c", script],
             env=env,
@@ -112,6 +117,10 @@ class NetworkModeTests(unittest.TestCase):
 
     def test_wifi_only_allows_ethernet(self):
         self.assertTrue(self.allows(1, "wlan0"))
+
+    def test_mobile_only_can_select_sim_subscription(self):
+        self.assertTrue(self.allows(2, "rmnet_data1", "4"))
+        self.assertFalse(self.allows(2, "rmnet_data2", "4"))
 
 
 class SettingsDecodeTests(unittest.TestCase):
