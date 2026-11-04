@@ -82,13 +82,24 @@ class NetworkModeTests(unittest.TestCase):
         cls.mobile_detector = function("is_mobile_data_iface")
         cls.sub_filter = function("mobile_iface_matches_selected_sub")
         cls.mode_detector = function("network_mode_allows_interface")
+        cls.effective_mode = function("effective_network_mode")
+        cls.effective_sub = function("effective_mobile_data_sub_id")
+        cls.trigger_enabled = function("network_trigger_enabled")
 
-    def allows(self, mode, iface, selected_sub="auto"):
+    def allows(self, mode, iface, selected_sub="auto", trigger_mode="", trigger_sub="", trigger_enabled="false"):
         script = (
             "query_settings() { case \"$1\" in networkMode) printf '%s\\n' \"$NETWORK_MODE\" ;; mobileDataSubId) printf '%s\\n' \"$MOBILE_SUB\" ;; esac; }\n"
+            + "query_trigger_settings() { case \"$1\" in enabled) printf '%s\\n' \"$TRIGGER_ENABLED\" ;; networkMode) printf '%s\\n' \"$TRIGGER_MODE\" ;; mobileDataSubId) printf '%s\\n' \"$TRIGGER_SUB\" ;; esac; }\n"
+            + "TRIGGER_FILE=\"$TRIGGER_PATH\"; if [ \"$TRIGGER_PRESENT\" != 1 ]; then TRIGGER_FILE=/dev/null; fi\n"
             + self.mobile_detector
             + "\n"
             + self.sub_filter
+            + "\n"
+            + self.trigger_enabled
+            + "\n"
+            + self.effective_mode
+            + "\n"
+            + self.effective_sub
             + "\n"
             + "mobile_iface_sub_id() { case \"$1\" in rmnet_data1) printf '4\\n' ;; rmnet_data2) printf '1\\n' ;; *) printf '\\n' ;; esac; }\n"
             + self.mode_detector
@@ -98,13 +109,21 @@ class NetworkModeTests(unittest.TestCase):
         env["NETWORK_MODE"] = str(mode)
         env["TEST_IFACE"] = iface
         env["MOBILE_SUB"] = selected_sub
-        return subprocess.run(
-            [shutil.which("sh"), "-c", script],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).returncode == 0
+        env["TRIGGER_MODE"] = trigger_mode
+        env["TRIGGER_SUB"] = trigger_sub
+        env["TRIGGER_ENABLED"] = trigger_enabled
+        env["TRIGGER_PRESENT"] = "1" if trigger_mode else "0"
+        with tempfile.TemporaryDirectory() as trigger_dir:
+            env["TRIGGER_PATH"] = str(Path(trigger_dir) / "trigger.base64")
+            if trigger_mode:
+                Path(env["TRIGGER_PATH"]).write_text("{}")
+            return subprocess.run(
+                [shutil.which("sh"), "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).returncode == 0
 
     def test_mobile_only_allows_rmnet(self):
         self.assertTrue(self.allows(2, "rmnet_data2"))
@@ -122,6 +141,13 @@ class NetworkModeTests(unittest.TestCase):
         self.assertTrue(self.allows(2, "rmnet_data1", "4"))
         self.assertFalse(self.allows(2, "rmnet_data2", "4"))
 
+    def test_standalone_trigger_network_overrides_legacy_setting(self):
+        self.assertTrue(self.allows(0, "rmnet_data1", "auto", "2", "4", "true"))
+        self.assertFalse(self.allows(0, "rmnet_data2", "auto", "2", "4", "true"))
+
+    def test_disabled_trigger_does_not_restrict_manual_network(self):
+        self.assertTrue(self.allows(2, "wlan0", "4", "2", "4", "false"))
+
 
 class SettingsDecodeTests(unittest.TestCase):
     @classmethod
@@ -133,8 +159,8 @@ class SettingsDecodeTests(unittest.TestCase):
             end = source.index("\n}", start) + len("\n}")
             return source[start:end]
 
-        cls.decoder = function("decode_settings")
-        cls.query = function("query_settings")
+        cls.decoder = function("decode_json_file")
+        cls.query = function("query_json_file")
 
     def query_mode(self, payload, storage="base64"):
         encoded = payload.encode()
@@ -150,7 +176,7 @@ class SettingsDecodeTests(unittest.TestCase):
                 "DATADIR=" + shlex.quote(data_dir) + "\n"
                 + self.decoder + "\n"
                 + self.query + "\n"
-                + "query_settings networkMode\n"
+                + "query_json_file \"$DATADIR/settings.base64\" networkMode\n"
             )
             result = subprocess.run(
                 [shutil.which("sh"), "-c", script],

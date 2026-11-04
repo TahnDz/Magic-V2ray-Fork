@@ -141,6 +141,8 @@ case "$1" in
     start)   start_proxy ;;
     stop)    stop_proxy ;;
     restart) send_cmd_sync "hard_restart" && echo "restarted" ;;
+    arm_trigger) send_cmd_sync "arm_trigger" && echo "trigger armed" ;;
+    disarm_trigger) send_cmd_sync "disarm_trigger" && echo "trigger disarmed" ;;
     reload)  reload_proxy ;;
     status)  get_status ;;
     reapply) send_cmd_sync "apply_cur_iface" ;;
@@ -151,7 +153,7 @@ case "$1" in
     latency_heartbeat)      send_cmd "latency_heartbeat" ;;
     reset_mobile_network)   send_cmd_sync "reset_mobile_network" ;;
     *)
-        echo "usage: $0 {start|stop|restart|reload|status|reapply|start_monitor|stop_monitor|start_monitor_latency|stop_monitor_latency|latency_heartbeat|reset_mobile_network}" >&2
+        echo "usage: $0 {start|stop|restart|reload|status|reapply|arm_trigger|disarm_trigger|start_monitor|stop_monitor|start_monitor_latency|stop_monitor_latency|latency_heartbeat|reset_mobile_network}" >&2
         exit 2
         ;;
 esac

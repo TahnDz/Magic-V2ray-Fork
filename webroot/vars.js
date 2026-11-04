@@ -2,6 +2,9 @@ const MODDIR = "/data/adb/modules/magic_v2ray";
 const DATADIR = "/data/adb/magic_v2ray";
 const PROFILES_FILE = `${DATADIR}/profiles.base64`;
 const SETTINGS_FILE = `${DATADIR}/settings.base64`;
+// Passive network-trigger settings are kept separately so changing the
+// trigger cannot be lost when an older WebView rewrites the main settings.
+const TRIGGER_FILE = `${DATADIR}/trigger.base64`;
 const ACTIVE_FILE = `${DATADIR}/active_config.txt`;
 const CONFIG_JSON = `${DATADIR}/config.v2.json`;
 const IP_HUNT_FILE = `${DATADIR}/ip_hunt.list`;
@@ -77,6 +80,11 @@ const LATENCY_HB_FILE = `${STUB_DIR}/run/latency.hb`;
 const LOG_CTRL = `${LOG_DIR}/control.pipe`;
  
 let profiles = {};
+let triggerSettings = {
+    enabled: false,
+    networkMode: 0,
+    mobileDataSubId: "auto"
+};
 // Raw text of CONFIG_JSON, kept in memory while professional mode is on so
 // the textarea has something to show without a re-read on every keystroke.
 let customConfigText = "";

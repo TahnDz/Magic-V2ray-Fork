@@ -298,20 +298,6 @@
                 <div class="settings-group-box">
                     <h4 data-i18n="group_network_os">Interfaces &amp; tethering</h4>
                     <div class="setting-item-row">
-                        <label><span data-i18n="lbl_networkmode">Apply Proxy On</span><small data-i18n="desc_networkmode">Restrict which network interfaces are routed through the proxy</small></label>
-                        <select id="set-networkmode">
-                            <option value="0" data-i18n="network_mode_all">All Networks</option>
-                            <option value="1" data-i18n="network_mode_wifi">WiFi / Ethernet Only</option>
-                            <option value="2" data-i18n="network_mode_mobile">Mobile Data Only</option>
-                        </select>
-                    </div>
-                    <div class="setting-item-row">
-                        <label for="set-mobile-data-subid"><span data-i18n="lbl_mobile_data_sim">Mobile data SIM</span><small data-i18n="desc_mobile_data_sim">Only trigger the proxy for this SIM's active data interface. Auto follows Android's default data SIM.</small></label>
-                        <select id="set-mobile-data-subid">
-                            <option value="auto" data-i18n="mobile_sim_auto">Auto (Android default)</option>
-                        </select>
-                    </div>
-                    <div class="setting-item-row">
                         <label for="set-upstreamiface"><span data-i18n="lbl_upstreamiface">Upstream network interface</span><small data-i18n="desc_upstreamiface">Network interface Xray itself connects out through. Auto follows the system's active network.</small></label>
                         <select id="set-upstreamiface">
                             <option value="auto" data-i18n="upstream_iface_auto">Auto</option>
@@ -343,6 +329,31 @@
                         <div class="setting-item-row">
                             <label data-i18n="lbl_bypassiface_list">Interfaces (comma-separated)</label>
                             <input type="text" id="set-bypassiface-list" placeholder="tailscale0,wt0">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="settings-group-box trigger-settings-box">
+                    <h4 data-i18n="group_network_trigger">Passive network trigger</h4>
+                    <p class="lan-bypass-desc" data-i18n="network_trigger_notice">Automatically start and stop the engine when the selected network is ready. Android's data SIM is never changed.</p>
+                    <div class="setting-item-row toggle-row">
+                        <label for="set-trigger-enabled"><span data-i18n="lbl_trigger_enabled">Enable passive trigger</span><small data-i18n="desc_trigger_enabled">Wait for the selected network and proxy target, then start Xray. Stop automatically when the network no longer matches.</small></label>
+                        <input type="checkbox" id="set-trigger-enabled" onchange="syncTriggerFields()">
+                    </div>
+                    <div id="trigger-sub-fields" class="sub-setting-panel">
+                        <div class="setting-item-row">
+                            <label for="set-trigger-networkmode"><span data-i18n="lbl_trigger_network">Trigger on network</span><small data-i18n="desc_trigger_network">Choose which active network can trigger the engine.</small></label>
+                            <select id="set-trigger-networkmode" onchange="syncTriggerFields()">
+                                <option value="0" data-i18n="network_mode_all">All Networks</option>
+                                <option value="1" data-i18n="network_mode_wifi">WiFi / Ethernet Only</option>
+                                <option value="2" data-i18n="network_mode_mobile">Mobile Data Only</option>
+                            </select>
+                        </div>
+                        <div class="setting-item-row" id="trigger-mobile-sim-row">
+                            <label for="set-trigger-mobile-data-subid"><span data-i18n="lbl_trigger_mobile_sim">Trigger data SIM</span><small data-i18n="desc_trigger_mobile_sim">Only this SIM's active data interface can trigger the engine.</small></label>
+                            <select id="set-trigger-mobile-data-subid">
+                                <option value="auto" data-i18n="mobile_sim_auto">Auto (Android default)</option>
+                            </select>
                         </div>
                     </div>
                 </div>

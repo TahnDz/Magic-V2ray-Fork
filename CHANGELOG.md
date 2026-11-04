@@ -1,6 +1,11 @@
-# Magic V2Ray v1.28.2 Release Notes
+# Magic V2Ray v1.28.3 Release Notes
 
 An urgent core security update alongside targeted routing and control fixes.
+
+Network trigger settings now have their own passive trigger section, with
+separate enable state, network type, and SIM selection that survive WebView
+reloads. The trigger starts only after the selected network and proxy target
+are ready, and stops when the network no longer matches.
 
 The Network settings Save action now survives a cached older WebView bundle,
 and reports write failures instead of claiming that settings were saved.

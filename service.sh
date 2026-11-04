@@ -101,10 +101,14 @@ IP_HUNT_FILE="$DATADIR/ip_hunt.list"
 # entirely. Plain file rather than a settings.base64 key — same pattern as
 # IP_HUNT_FILE: existence means enabled, content is the interface list.
 BYPASS_IFACE_FILE="$DATADIR/bypassIface.txt"
+# Standalone passive network-trigger settings. The WebUI keeps this separate
+# from the large settings blob so trigger choices survive older WebViews.
+TRIGGER_FILE="$DATADIR/trigger.base64"
 ENABLED_FLAG="$DATADIR/enabled"
 # Runtime-only marker: the user still wants the engine enabled, but the
 # selected network mode currently excludes the active interface.
 NETWORK_PAUSED_FLAG="$RUN_DIR/network_paused"
+TRIGGER_SUPPRESSED_FLAG="$RUN_DIR/trigger_suppressed"
 
 # Runtime state files (tmpfs; cleared on every boot)
 PIDFILE="$RUN_DIR/xray.pid"
@@ -307,13 +311,12 @@ TARGET_WAIT_TIMEOUT=60
 # 2. Settings helpers
 # ===========================================================================
 
-# Decode the settings file. writeFileB64() uses base64 only as a safe shell
-# transport and stores decoded JSON; older builds stored one or two encoded
-# layers. Accept all three formats so an upgrade never resets network settings.
-decode_settings() {
-    local settings_file="$DATADIR/settings.base64" decoded
-    [ -f "$settings_file" ] || return 1
-    decoded=$(cat "$settings_file" 2>/dev/null) || return 1
+# Decode a JSON file written by writeFileB64(). The current format is plain
+# JSON; older builds stored one or two encoded layers.
+decode_json_file() {
+    local json_file="$1" decoded
+    [ -f "$json_file" ] || return 1
+    decoded=$(cat "$json_file" 2>/dev/null) || return 1
     case "$decoded" in
         \{*) printf '%s\n' "$decoded"; return 0 ;;
     esac
@@ -324,14 +327,93 @@ decode_settings() {
     esac
 }
 
+# Kept as a named wrapper for older callers and the fixture tests.
+decode_settings() {
+    decode_json_file "$DATADIR/settings.base64"
+}
+
 # Reads one field out of the settings blob written by the UI. jq was a 2 MB
 # dependency for this single lookup; sed does it adequately for flat scalars.
-query_settings() {
-    local key="$1"
-    decode_settings \
+query_json_file() {
+    local json_file="$1" key="$2"
+    decode_json_file "$json_file" \
         | tr ',{}' '\n\n\n' \
         | sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" \
         | head -n 1
+}
+
+query_settings() {
+    query_json_file "$DATADIR/settings.base64" "$1"
+}
+
+query_trigger_settings() {
+    query_json_file "$TRIGGER_FILE" "$1"
+}
+
+# Trigger settings override the legacy fields when the standalone file exists;
+# the fallback keeps upgrades from changing behavior before the user saves the
+# new Trigger section once.
+effective_network_mode() {
+    local mode
+    if [ -s "$TRIGGER_FILE" ]; then
+        if ! network_trigger_enabled; then
+            printf '0\n'
+            return 0
+        fi
+        mode="$(query_trigger_settings networkMode 2>/dev/null)"
+        case "$mode" in
+            0|1|2) printf '%s\n' "$mode"; return 0 ;;
+        esac
+        printf '0\n'
+        return 0
+    fi
+    mode="$(query_settings networkMode 2>/dev/null)"
+    case "$mode" in
+        0|1|2) printf '%s\n' "$mode"; return 0 ;;
+    esac
+    printf '0\n'
+}
+
+effective_mobile_data_sub_id() {
+    local selected
+    if [ -s "$TRIGGER_FILE" ]; then
+        if ! network_trigger_enabled; then
+            printf 'auto\n'
+            return 0
+        fi
+        selected="$(query_trigger_settings mobileDataSubId 2>/dev/null)"
+        case "$selected" in
+            auto) printf '%s\n' "$selected"; return 0 ;;
+            ''|*[!0-9]*) ;;
+            *) printf '%s\n' "$selected"; return 0 ;;
+        esac
+        printf 'auto\n'
+        return 0
+    fi
+    selected="$(query_settings mobileDataSubId 2>/dev/null)"
+    case "$selected" in
+        auto) printf '%s\n' "$selected"; return 0 ;;
+        ''|*[!0-9]*) ;;
+        *) printf '%s\n' "$selected"; return 0 ;;
+    esac
+    printf 'auto\n'
+}
+
+network_trigger_enabled() {
+    local enabled
+    if [ -s "$TRIGGER_FILE" ]; then
+        enabled="$(query_trigger_settings enabled 2>/dev/null)"
+        [ "$enabled" = true ]
+        return
+    fi
+    enabled="$(query_trigger_settings enabled 2>/dev/null)"
+    [ "$enabled" = true ] && return 0
+    # Legacy fallback for a setting written before trigger.base64 existed.
+    [ "$(query_settings triggerEnabled 2>/dev/null)" = true ] && return 0
+    case "$(query_settings networkMode 2>/dev/null)" in
+        1|2) return 0 ;;
+    esac
+    return 1
 }
 
 # Boolean settings default to false when absent or unreadable (fail closed).
@@ -687,7 +769,7 @@ mobile_iface_sub_id() {
 
 mobile_iface_matches_selected_sub() {
     local iface="$1" selected actual
-    selected="$(query_settings mobileDataSubId 2>/dev/null)"
+    selected="$(effective_mobile_data_sub_id)"
     case "$selected" in
         ''|auto) return 0 ;;
         *[!0-9]*) return 1 ;;
@@ -702,7 +784,7 @@ mobile_iface_matches_selected_sub() {
 network_mode_allows_interface() {
     local iface="$1" mode
     [ -n "$iface" ] || return 1
-    mode="$(query_settings networkMode 2>/dev/null)"
+    mode="$(effective_network_mode)"
     case "$mode" in
         1)
             if is_mobile_data_iface "$iface"; then return 1; fi
@@ -772,12 +854,25 @@ wait_for_proxy_target() {
 # of XRAY_PID and keeps start/stop serialized with WebUI actions.
 request_network_reconcile() {
     [ -p "$PIPE_FILE" ] || return 0
-    # Boot sequencing owns the first start. The monitor only reconciles a
-    # running engine or one explicitly paused by the network-mode gate.
-    if ! is_proc_running "xray" && [ ! -f "$NETWORK_PAUSED_FLAG" ]; then
+    local trigger_armed=false
+    if network_trigger_enabled && [ -s "$DATADIR/$CONFIG_NAME" ] \
+        && [ ! -f "$TRIGGER_SUPPRESSED_FLAG" ]; then
+        touch "$ENABLED_FLAG"
+        trigger_armed=true
+    fi
+    # Boot sequencing owns the first start unless the passive trigger is armed.
+    if ! is_proc_running "xray" && [ ! -f "$NETWORK_PAUSED_FLAG" ] \
+        && [ "$trigger_armed" != true ]; then
         return 0
     fi
     timeout 2 sh -c "printf '%s\\n' network_sync > '$PIPE_FILE'" 2>/dev/null || true
+}
+
+# A passive trigger owns the engine only while its selected network is active.
+# Manual Start/Stop remains explicit when the trigger is disabled.
+trigger_should_run() {
+    network_trigger_enabled || return 1
+    network_mode_allows_active
 }
 
 # Hunter state. Previously every mismatch fired another radio restart with no
@@ -1547,7 +1642,7 @@ apply_routing_rules() {
     ipv6_enabled="$(setting_is_true enableIPv6 && echo true || echo false)"
     echo "IPv6 enabled: $ipv6_enabled"
 
-    network_mode="$(query_settings networkMode)"
+    network_mode="$(effective_network_mode)"
     [ -z "$network_mode" ] && network_mode=0
     echo "Network mode: $network_mode"
 
@@ -2192,7 +2287,28 @@ do_job() {
             return 0
             ;;
         network_sync)
-            if [ -f "$ENABLED_FLAG" ]; then
+            if network_trigger_enabled && [ ! -f "$TRIGGER_SUPPRESSED_FLAG" ]; then
+                if trigger_should_run; then
+                    rm -f "$TRIGGER_SUPPRESSED_FLAG"
+                    touch "$ENABLED_FLAG"
+                    if ! is_proc_running "xray"; then
+                        log "passive trigger matched active network; starting engine"
+                        start_xray
+                    fi
+                else
+                    if is_proc_running "xray"; then
+                        log "passive trigger no longer matches active network; stopping engine"
+                        stop_xray false
+                    else
+                        rm -f "$ENABLED_FLAG"
+                        remove_mark_rule
+                    fi
+                fi
+            elif network_trigger_enabled; then
+                # A manual Stop suppresses the passive trigger until the user
+                # explicitly starts it or saves the Trigger section again.
+                return 0
+            elif [ -f "$ENABLED_FLAG" ]; then
                 if network_mode_allows_active; then
                     if is_proc_running "xray"; then
                         # The interface monitor already re-pins on an
@@ -2219,11 +2335,25 @@ do_job() {
             return 0
             ;;
         start)
+            rm -f "$TRIGGER_SUPPRESSED_FLAG"
             start_xray
             return 0
             ;;
         stop)
+            touch "$TRIGGER_SUPPRESSED_FLAG"
             stop_xray
+            return 0
+            ;;
+        arm_trigger)
+            rm -f "$TRIGGER_SUPPRESSED_FLAG"
+            if network_trigger_enabled; then
+                touch "$ENABLED_FLAG"
+            fi
+            return 0
+            ;;
+        disarm_trigger)
+            touch "$TRIGGER_SUPPRESSED_FLAG"
+            rm -f "$ENABLED_FLAG"
             return 0
             ;;
         reload_config)
@@ -2233,11 +2363,20 @@ do_job() {
         hard_restart)
             # Full stop+start (rules rebuilt) with all non-xray traffic held
             # for the whole window, so nothing leaks while rules are down.
+            local restart_enabled=false
+            [ -f "$ENABLED_FLAG" ] && restart_enabled=true
+            if network_trigger_enabled && [ ! -f "$TRIGGER_SUPPRESSED_FLAG" ]; then
+                restart_enabled=true
+            fi
             hold_traffic
-            # Preserve the user's enabled intent if the current network mode
-            # temporarily pauses the engine during a handover.
-            stop_xray true
-            start_xray || log "hard_restart: start failed"
+            if [ "$restart_enabled" = true ]; then
+                # Preserve the user's enabled intent if the current network
+                # mode temporarily pauses the engine during a handover.
+                stop_xray true
+                start_xray || log "hard_restart: start failed"
+            else
+                stop_xray false
+            fi
             release_traffic
             return 0
             ;;
@@ -2355,7 +2494,8 @@ fi
 # Resume the previous session only if the user actually left the engine
 # running. This used to key off the mere existence of $CONFIG_NAME, so a
 # config that had been explicitly stopped still came back at boot.
-if [ -s "$DATADIR/$CONFIG_NAME" ] && [ -f "$ENABLED_FLAG" ]; then
+if [ -s "$DATADIR/$CONFIG_NAME" ] && [ -f "$ENABLED_FLAG" ] \
+    && [ ! -f "$TRIGGER_SUPPRESSED_FLAG" ]; then
     log "restoring previous session"
     echo "start" > "$PIPE_FILE"
     echo "wait"  > "$PIPE_FILE"

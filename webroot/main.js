@@ -535,13 +535,33 @@ function loadState(callback) {
                         console.warn("[loadState] settings corrupt, falling back to defaults.");
                     }
                 }
-                execShell(`cat '${CONFIG_JSON}' 2>/dev/null || echo ''`, (configRaw) => {
-                    customConfigText = (configRaw || '').trim();
-                    execShell(`cat '${HOSTS_FILE}' 2>/dev/null || echo ''`, (hostsRaw) => {
-                        initHostsFileIfNeeded(hostsRaw || '', (finalText) => {
-                            hostsFileText = finalText;
-                            bindSettingsToFormView();
-                            if (callback) callback();
+                execShell(`cat '${TRIGGER_FILE}' 2>/dev/null || echo ''`, (triggerRaw) => {
+                    const parsedTrigger = parseStoredJson(triggerRaw, null);
+                    const legacyMode = sanitizeNetworkMode(advSettings.networkMode, 0);
+                    const legacySubId = sanitizeMobileDataSubId(advSettings.mobileDataSubId);
+                    if (parsedTrigger && typeof parsedTrigger === 'object' && !Array.isArray(parsedTrigger)) {
+                        triggerSettings = {
+                            enabled: parsedTrigger.enabled === true,
+                            networkMode: sanitizeNetworkMode(parsedTrigger.networkMode, legacyMode),
+                            mobileDataSubId: sanitizeMobileDataSubId(parsedTrigger.mobileDataSubId || legacySubId)
+                        };
+                    } else {
+                        // Migrate the old fields into the standalone trigger
+                        // model on the next Network-tab save.
+                        triggerSettings = {
+                            enabled: advSettings.triggerEnabled === true || legacyMode !== 0,
+                            networkMode: legacyMode,
+                            mobileDataSubId: legacySubId
+                        };
+                    }
+                    execShell(`cat '${CONFIG_JSON}' 2>/dev/null || echo ''`, (configRaw) => {
+                        customConfigText = (configRaw || '').trim();
+                        execShell(`cat '${HOSTS_FILE}' 2>/dev/null || echo ''`, (hostsRaw) => {
+                            initHostsFileIfNeeded(hostsRaw || '', (finalText) => {
+                                hostsFileText = finalText;
+                                bindSettingsToFormView();
+                                if (callback) callback();
+                            });
                         });
                     });
                 });
@@ -670,6 +690,7 @@ function _markStatusPending() {
 // interpolated straight into the command.
 const PROXY_CONTROL_ACTIONS = [
     'start', 'stop', 'restart', 'reload', 'status', 'reapply',
+    'arm_trigger', 'disarm_trigger',
     'start_monitor_latency', 'stop_monitor_latency', 'reset_mobile_network',
     'gateway_start', 'gateway_stop', 'gateway_status'
 ];
@@ -3652,8 +3673,15 @@ function bindSettingsToFormView() {
     toggleSubSettingField('set-fragment', 'fragment-sub-fields');
 
     document.getElementById('set-mtu').value = advSettings.mtu || 1350;
-    document.getElementById('set-networkmode').value = advSettings.networkMode ?? 0;
-    refreshMobileDataSimOptions(advSettings.mobileDataSubId);
+    const triggerEnabled = document.getElementById('set-trigger-enabled');
+    const triggerMode = document.getElementById('set-trigger-networkmode')
+        || document.getElementById('set-networkmode');
+    const triggerMobile = document.getElementById('set-trigger-mobile-data-subid')
+        || document.getElementById('set-mobile-data-subid');
+    if (triggerEnabled) triggerEnabled.checked = triggerSettings.enabled === true;
+    if (triggerMode) triggerMode.value = sanitizeNetworkMode(triggerSettings.networkMode, 0);
+    if (triggerMobile) refreshMobileDataSimOptions(triggerSettings.mobileDataSubId, triggerMobile.id);
+    syncTriggerFields();
     refreshUpstreamIfaceOptions(advSettings.upstreamIface);
     document.getElementById('set-allowtether').checked = advSettings.allowTether !== false;
     document.getElementById('set-bypassvpn').checked = advSettings.bypassVpnService !== false;
@@ -3744,9 +3772,34 @@ async function resetTrafficSettings() {
 // down and rebuilt, so this always forces the full restart.
 // Only touches its own fields on advSettings; everything else already lives
 // in memory from the last load/save of the Traffic form.
+function sanitizeNetworkMode(raw, fallback = 0) {
+    const value = parseInt(raw, 10);
+    return value === 0 || value === 1 || value === 2 ? value : fallback;
+}
+
+function triggerModeElement() {
+    return document.getElementById('set-trigger-networkmode')
+        || document.getElementById('set-networkmode');
+}
+
+function triggerMobileElement() {
+    return document.getElementById('set-trigger-mobile-data-subid')
+        || document.getElementById('set-mobile-data-subid');
+}
+
+function syncTriggerFields() {
+    const enabled = document.getElementById('set-trigger-enabled');
+    const panel = document.getElementById('trigger-sub-fields');
+    const mode = triggerModeElement();
+    const mobileRow = document.getElementById('trigger-mobile-sim-row');
+    if (panel) panel.style.display = !enabled || enabled.checked ? 'block' : 'none';
+    if (mobileRow) mobileRow.style.display = mode && mode.value === '2' ? '' : 'none';
+}
+
 function saveNetworkSettingsForm() {
-    const mode = document.getElementById('set-networkmode');
-    const mobileSubId = document.getElementById('set-mobile-data-subid');
+    const triggerEnabled = document.getElementById('set-trigger-enabled');
+    const mode = triggerModeElement();
+    const mobileSubId = triggerMobileElement();
     const upstream = document.getElementById('set-upstreamiface');
     const ipv6 = document.getElementById('set-enableipv6');
     const ipv6Ula = document.getElementById('set-enableipv6ula');
@@ -3756,10 +3809,14 @@ function saveNetworkSettingsForm() {
     // Keep values loaded from disk when a cached/older WebView is missing a
     // field added by a newer HTML bundle. A missing element must not abort the
     // save before writeFileB64() is reached, nor erase the stored setting.
-    if (mode) advSettings.networkMode = parseInt(mode.value, 10) || 0;
-    advSettings.mobileDataSubId = sanitizeMobileDataSubId(
-        mobileSubId ? mobileSubId.value : advSettings.mobileDataSubId
-    );
+    if (triggerEnabled) triggerSettings.enabled = triggerEnabled.checked;
+    if (mode) triggerSettings.networkMode = sanitizeNetworkMode(mode.value, triggerSettings.networkMode);
+    if (mobileSubId) triggerSettings.mobileDataSubId = sanitizeMobileDataSubId(mobileSubId.value);
+    // Mirror the standalone trigger values for older service builds and old
+    // settings readers; the trigger file remains the authoritative copy.
+    advSettings.triggerEnabled = triggerSettings.enabled === true;
+    advSettings.networkMode = sanitizeNetworkMode(triggerSettings.networkMode, 0);
+    advSettings.mobileDataSubId = sanitizeMobileDataSubId(triggerSettings.mobileDataSubId);
     if (upstream) advSettings.upstreamIface = sanitizeUpstreamIface(upstream.value);
     if (ipv6) advSettings.enableIPv6 = ipv6.checked;
     if (ipv6Ula) advSettings.enableIPv6ULA = ipv6Ula.checked;
@@ -3770,13 +3827,24 @@ function saveNetworkSettingsForm() {
     }
     delete advSettings.includeLan;
 
-    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), (_output, stderr, errno) => {
+    const triggerPayload = JSON.stringify({
+        enabled: triggerSettings.enabled === true,
+        networkMode: sanitizeNetworkMode(triggerSettings.networkMode, 0),
+        mobileDataSubId: sanitizeMobileDataSubId(triggerSettings.mobileDataSubId)
+    });
+    writeFileB64(TRIGGER_FILE, triggerPayload, (_output, triggerStderr, triggerErrno) => {
+        if (triggerErrno) {
+            console.error('[saveNetworkSettingsForm] trigger write failed', triggerStderr);
+            showToast(triggerStderr || t('toast_settings_save_failed'), 'error');
+            return;
+        }
+        writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), (_output, stderr, errno) => {
         if (errno) {
             console.error('[saveNetworkSettingsForm] settings write failed', stderr);
             showToast(stderr || t('toast_settings_save_failed'), 'error');
             return;
         }
-        applyBypassIfaceForm((_output, bypassStderr, bypassErrno) => {
+        const finishSave = () => applyBypassIfaceForm((_output, bypassStderr, bypassErrno) => {
             if (bypassErrno) {
                 console.error('[saveNetworkSettingsForm] bypass list write failed', bypassStderr);
                 showToast(bypassStderr || t('toast_settings_save_failed'), 'error');
@@ -3784,6 +3852,22 @@ function saveNetworkSettingsForm() {
             }
             showToast(t('toast_settings_saved'), "success");
             applyActiveConfig({ force: true });
+        });
+        if (triggerSettings.enabled) {
+            execShell(`sh ${MODDIR}/proxy_control.sh arm_trigger`, (_armOut, armErr, armErrno) => {
+                if (armErrno) {
+                    console.warn('[saveNetworkSettingsForm] trigger arm deferred', armErr);
+                }
+                finishSave();
+            });
+        } else {
+            execShell(`sh ${MODDIR}/proxy_control.sh disarm_trigger`, (_disarmOut, disarmErr, disarmErrno) => {
+                if (disarmErrno) {
+                    console.warn('[saveNetworkSettingsForm] trigger disarm deferred', disarmErr);
+                }
+                finishSave();
+            });
+        }
         });
     });
 }
@@ -3797,8 +3881,10 @@ function sanitizeMobileDataSubId(raw) {
     return value === 'auto' || !value ? 'auto' : (/^\d{1,10}$/.test(value) ? value : 'auto');
 }
 
-function refreshMobileDataSimOptions(selected) {
-    const select = document.getElementById('set-mobile-data-subid');
+function refreshMobileDataSimOptions(selected, elementId = 'set-trigger-mobile-data-subid') {
+    const select = document.getElementById(elementId)
+        || document.getElementById('set-trigger-mobile-data-subid')
+        || document.getElementById('set-mobile-data-subid');
     if (!select) return;
     const want = sanitizeMobileDataSubId(selected);
     const build = (entries) => {
