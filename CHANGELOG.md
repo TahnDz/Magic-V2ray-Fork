@@ -2,6 +2,10 @@
 
 An urgent core security update alongside targeted routing and control fixes.
 
+Network-mode lifecycle handling now stops the proxy when the selected network
+is inactive, prevents upstream policy rules from being installed before a
+usable default route exists, and preserves network settings across upgrades.
+
 Xray-core has been updated to v26.10.31. This release disables MPTCP by default to mitigate a critical Linux kernel vulnerability in IPv4 MPTCP listening, significantly reducing potential attack exposure. Users are strongly urged to update promptly.
 
 Network detection logic in `service.sh` now properly recognizes system default network rules that specify full-range UIDs (0-2147483647), preventing per-app rules from interfering with default interface resolution.
