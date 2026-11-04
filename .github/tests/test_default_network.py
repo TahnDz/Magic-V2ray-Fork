@@ -2,9 +2,13 @@
 
 Run: python3 -m unittest discover -s .github/tests
 """
+import base64
 from pathlib import Path
+import os
+import shlex
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -63,6 +67,92 @@ class DefaultNetworkTests(unittest.TestCase):
 
     def test_empty_rules_yield_no_default(self):
         self.assertEqual(self.detect(""), "")
+
+
+class NetworkModeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = (Path(__file__).resolve().parents[2] / "service.sh").read_text()
+
+        def function(name):
+            start = source.index(name + "() {\n")
+            end = source.index("\n}", start) + len("\n}")
+            return source[start:end]
+
+        cls.mobile_detector = function("is_mobile_data_iface")
+        cls.mode_detector = function("network_mode_allows_interface")
+
+    def allows(self, mode, iface):
+        script = (
+            "query_settings() { printf '%s\\n' \"$NETWORK_MODE\"; }\n"
+            + self.mobile_detector
+            + "\n"
+            + self.mode_detector
+            + "\nnetwork_mode_allows_interface \"$TEST_IFACE\"\n"
+        )
+        env = os.environ.copy()
+        env["NETWORK_MODE"] = str(mode)
+        env["TEST_IFACE"] = iface
+        return subprocess.run(
+            [shutil.which("sh"), "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).returncode == 0
+
+    def test_mobile_only_allows_rmnet(self):
+        self.assertTrue(self.allows(2, "rmnet_data2"))
+
+    def test_mobile_only_bypasses_wifi(self):
+        self.assertFalse(self.allows(2, "wlan0"))
+
+    def test_wifi_only_bypasses_mobile(self):
+        self.assertFalse(self.allows(1, "rmnet_data2"))
+
+    def test_wifi_only_allows_ethernet(self):
+        self.assertTrue(self.allows(1, "wlan0"))
+
+
+class SettingsDecodeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = (Path(__file__).resolve().parents[2] / "service.sh").read_text()
+
+        def function(name):
+            start = source.index(name + "() {\n")
+            end = source.index("\n}", start) + len("\n}")
+            return source[start:end]
+
+        cls.decoder = function("decode_settings")
+        cls.query = function("query_settings")
+
+    def query_mode(self, payload, double_encoded=False):
+        encoded = base64.b64encode(payload.encode())
+        if double_encoded:
+            encoded = base64.b64encode(encoded)
+        with tempfile.TemporaryDirectory() as data_dir:
+            Path(data_dir, "settings.base64").write_bytes(encoded)
+            script = (
+                "DATADIR=" + shlex.quote(data_dir) + "\n"
+                + self.decoder + "\n"
+                + self.query + "\n"
+                + "query_settings networkMode\n"
+            )
+            result = subprocess.run(
+                [shutil.which("sh"), "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+    def test_current_settings_decode_once(self):
+        self.assertEqual(self.query_mode('{"networkMode":2}'), "2")
+
+    def test_legacy_double_encoded_settings_are_read(self):
+        self.assertEqual(self.query_mode('{"networkMode":2}', double_encoded=True), "2")
 
 
 if __name__ == "__main__":

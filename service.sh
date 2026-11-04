@@ -59,12 +59,16 @@ IP_HUNT_FILE="$DATADIR/ip_hunt.list"
 # IP_HUNT_FILE: existence means enabled, content is the interface list.
 BYPASS_IFACE_FILE="$DATADIR/bypassIface.txt"
 ENABLED_FLAG="$DATADIR/enabled"
+# Runtime-only marker: the user still wants the engine enabled, but the
+# selected network mode currently excludes the active interface.
+NETWORK_PAUSED_FLAG="$RUN_DIR/network_paused"
 
 # Runtime state files (tmpfs; cleared on every boot)
 PIDFILE="$RUN_DIR/xray.pid"
 TIME_RES_FILE="$RUN_DIR/time_res"
 ADDR_INFO_FILE="$RUN_DIR/addr_info"
 LATENCY_HB_FILE="$RUN_DIR/latency.hb"
+SYSCTL_BACKUP_FILE="$RUN_DIR/proxy_sysctl.bak"
 PIPE_FILE="$RUN_DIR/control.pipe"
 IFACE_EVENT_PIPE="$RUN_DIR/iface_events.pipe"
 IFACE_MON_CHILD="$RUN_DIR/iface_monitor_child.pid"
@@ -259,14 +263,25 @@ LATENCY_HB_TIMEOUT=15
 # 2. Settings helpers
 # ===========================================================================
 
-# Reads one field out of the base64-encoded settings blob written by the UI.
-# jq was a 2 MB dependency for this single lookup; sed does it adequately for
-# the flat scalar fields we need.
+# Decode the settings file. Current WebUI builds store one base64 layer because
+# writeFileB64() owns the encoding; older builds accidentally stored two. Keep
+# the fallback so an upgrade does not reset network settings before the UI has
+# a chance to rewrite them.
+decode_settings() {
+    local settings_file="$DATADIR/settings.base64" decoded
+    [ -f "$settings_file" ] || return 1
+    decoded=$(base64 -d "$settings_file" 2>/dev/null) || return 1
+    case "$decoded" in
+        \{*) printf '%s\n' "$decoded" ;;
+        *) printf '%s' "$decoded" | base64 -d 2>/dev/null || return 1 ;;
+    esac
+}
+
+# Reads one field out of the settings blob written by the UI. jq was a 2 MB
+# dependency for this single lookup; sed does it adequately for flat scalars.
 query_settings() {
     local key="$1"
-    local settings_file="$DATADIR/settings.base64"
-    [ ! -f "$settings_file" ] && return 1
-    base64 -d "$settings_file" 2>/dev/null \
+    decode_settings \
         | tr ',{}' '\n\n\n' \
         | sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" \
         | head -n 1
@@ -280,9 +295,7 @@ setting_is_true() {
 # True when the key exists in the settings blob at all (query_settings cannot
 # tell "absent" from "empty string").
 setting_present() {
-    local settings_file="$DATADIR/settings.base64"
-    [ -f "$settings_file" ] || return 1
-    base64 -d "$settings_file" 2>/dev/null | grep -q "\"$1\"[[:space:]]*:"
+    decode_settings | grep -q "\"$1\"[[:space:]]*:"
 }
 
 # lan_skip_filter <all> <unticked> <always>
@@ -430,6 +443,16 @@ get_active_interface() {
     return 0
 }
 
+# A routing table entry alone is not enough during Android's network handover:
+# netd publishes the table before its default route and gateway are usable.
+# Refuse to pin Xray until the table contains a real default route.
+interface_has_usable_route() {
+    local iface="$1" table
+    table=$(read_table_index "$iface") || return 1
+    $ip route show table "$table" 2>/dev/null \
+        | grep -qE '(^|[[:space:]])default([[:space:]]|$)'
+}
+
 remove_mark_rule() {
     while $ip    rule del fwmark $FWMARK priority $RULE_PRIORITY 2>/dev/null; do :; done
     while $ip -6 rule del fwmark $FWMARK priority $RULE_PRIORITY 2>/dev/null; do :; done
@@ -445,6 +468,10 @@ apply_mark_rule() {
 
     if ! iface_index="$(read_table_index "$iface")"; then
         log "no routing table for interface $iface; mark rule not applied"
+        return 1
+    fi
+    if ! interface_has_usable_route "$iface"; then
+        log "interface $iface has no usable default route; mark rule not applied"
         return 1
     fi
 
@@ -475,7 +502,7 @@ get_upstream_interface() {
             ;;
     esac
     if [ "$want" != "$TUN_NAME" ] && [ -d "/sys/class/net/$want" ] \
-        && read_table_index "$want" >/dev/null; then
+        && interface_has_usable_route "$want"; then
         UPSTREAM_WARNED=""
         echo "$want"
         return 0
@@ -489,6 +516,17 @@ get_upstream_interface() {
 # Re-pins the fwmark rule to the current upstream interface.
 refresh_mark_rule() {
     local up
+    # A stopped engine must not leave a fwmark rule behind. Applying it while
+    # the modem is still bringing its table up can also interfere with netd's
+    # mobile-data setup, so only the live Xray process may own this rule.
+    if ! is_proc_running "xray"; then
+        remove_mark_rule
+        return 0
+    fi
+    if ! network_mode_allows_active; then
+        remove_mark_rule
+        return 0
+    fi
     if up=$(get_upstream_interface); then
         apply_mark_rule "$up"
     else
@@ -526,6 +564,43 @@ is_mobile_data_iface() {
         rmnet*|ccmni*|pdp*|wwan*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Whether the selected Network-tab mode permits traffic on the system's
+# current default interface. An absent interface means netd has not completed
+# the handover yet; keep Xray stopped until a usable network is published.
+network_mode_allows_interface() {
+    local iface="$1" mode
+    [ -n "$iface" ] || return 1
+    mode="$(query_settings networkMode 2>/dev/null)"
+    case "$mode" in
+        1)
+            if is_mobile_data_iface "$iface"; then return 1; fi
+            return 0
+            ;;
+        2) is_mobile_data_iface "$iface" ;;
+        *) return 0 ;;
+    esac
+}
+
+network_mode_allows_active() {
+    local active
+    active=$(get_active_interface) || return 1
+    interface_has_usable_route "$active" || return 1
+    network_mode_allows_interface "$active"
+}
+
+# Ask the command loop to reconcile the engine from the parent shell. The
+# interface monitor runs in a child, so sending a command avoids stale copies
+# of XRAY_PID and keeps start/stop serialized with WebUI actions.
+request_network_reconcile() {
+    [ -p "$PIPE_FILE" ] || return 0
+    # Boot sequencing owns the first start. The monitor only reconciles a
+    # running engine or one explicitly paused by the network-mode gate.
+    if ! is_proc_running "xray" && [ ! -f "$NETWORK_PAUSED_FLAG" ]; then
+        return 0
+    fi
+    printf '%s\n' network_sync > "$PIPE_FILE"
 }
 
 # Hunter state. Previously every mismatch fired another radio restart with no
@@ -770,13 +845,17 @@ monitor_net_interfaces() {
     cur_up=$(get_upstream_interface) || cur_up=""
     if [ -n "$cur_act" ] || [ -n "$cur_up" ]; then
         log "initial active interface: ${cur_act:-none}, upstream: ${cur_up:-none}"
-        if [ -n "$cur_up" ]; then
+        # Do not install an upstream rule during boot just because an
+        # interface/table exists. The modem may still be negotiating; only a
+        # running Xray process is allowed to pin fwmark 255.
+        if [ -n "$cur_up" ] && is_proc_running "xray"; then
             apply_mark_rule "$cur_up" || cur_up=""
         fi
         ula_apply "$cur_act"
     else
         log "no active interface at startup"
     fi
+    request_network_reconcile
 
     while read -r line; do
         # Coalesce the burst: keep reading until the stream is quiet for 1s,
@@ -800,6 +879,7 @@ monitor_net_interfaces() {
             # during a reconnect: re-assert the ULA (no-op if present or if
             # the feature is off).
             ula_apply "$cur_act"
+            request_network_reconcile
             continue
         fi
 
@@ -808,10 +888,12 @@ monitor_net_interfaces() {
             cur_act=""
             cur_up=""
             rm -f "$ADDR_INFO_FILE"
+            request_network_reconcile
             continue
         fi
 
-        if [ "$new_up" != "$cur_up" ] && [ -n "$new_up" ]; then
+        if [ "$new_up" != "$cur_up" ] && [ -n "$new_up" ] \
+            && is_proc_running "xray" && network_mode_allows_active; then
             log "upstream interface changed: ${cur_up:-none} -> $new_up"
             if apply_mark_rule "$new_up"; then
                 cur_up="$new_up"
@@ -832,6 +914,7 @@ monitor_net_interfaces() {
         else
             ula_apply "$cur_act"
         fi
+        request_network_reconcile
     done < "$IFACE_EVENT_PIPE"
 
     log "interface monitor exiting"
@@ -1143,15 +1226,45 @@ stop_latency_monitor() {
 # ===========================================================================
 #
 # ---------------------------------------------------------------------------
-# NOT MODIFIED IN THIS PASS.
-#
-# The known issues in this section — no abort when the TUN is missing, the
-# blanket FORWARD accept, unrestored sysctls, the hardcoded tethering DNS
-# target, and the unconditional IPv6 DNS drop — are staged as separate,
-# individually reviewable changes. Keeping them byte-identical here means any
-# regression from the lifecycle rework above cannot be mistaken for a routing
-# regression.
+# The firewall shape remains compatible with the existing module. Network
+# sysctls are snapshotted before this section changes them and restored when
+# the engine stops, so a proxy session cannot overwrite the device's baseline.
 # ---------------------------------------------------------------------------
+
+snapshot_network_sysctls() {
+    [ -f "$SYSCTL_BACKUP_FILE" ] && return 0
+    : > "$SYSCTL_BACKUP_FILE"
+    local path value
+    for path in \
+        /proc/sys/net/ipv4/ip_forward \
+        /proc/sys/net/ipv6/conf/all/forwarding \
+        /proc/sys/net/ipv6/conf/default/forwarding \
+        /proc/sys/net/ipv4/conf/all/rp_filter \
+        /proc/sys/net/ipv4/conf/default/rp_filter; do
+        [ -r "$path" ] || continue
+        value=$(cat "$path" 2>/dev/null) || continue
+        printf '%s %s\n' "$path" "$value" >> "$SYSCTL_BACKUP_FILE"
+    done
+    for path in /proc/sys/net/ipv4/conf/*/rp_filter; do
+        [ -r "$path" ] || continue
+        case "$path" in
+            */lo/rp_filter|*/"$TUN_NAME"/rp_filter) continue ;;
+        esac
+        value=$(cat "$path" 2>/dev/null) || continue
+        printf '%s %s\n' "$path" "$value" >> "$SYSCTL_BACKUP_FILE"
+    done
+}
+
+restore_network_sysctls() {
+    [ -f "$SYSCTL_BACKUP_FILE" ] || return 0
+    local path value
+    while read -r path value; do
+        case "$path" in
+            /proc/sys/net/*) [ -w "$path" ] && echo "$value" > "$path" 2>/dev/null ;;
+        esac
+    done < "$SYSCTL_BACKUP_FILE"
+    rm -f "$SYSCTL_BACKUP_FILE"
+}
 
 enable_forward() {
     echo "1" > "/proc/sys/net/ipv4/ip_forward"
@@ -1253,6 +1366,7 @@ configure_tun_iface() {
 }
 
 apply_routing_rules() {
+    snapshot_network_sysctls
     ipv6_enabled="$(setting_is_true enableIPv6 && echo true || echo false)"
     echo "IPv6 enabled: $ipv6_enabled"
 
@@ -1641,6 +1755,10 @@ release_traffic() {
 }
 
 clear_routing_rules() {
+    # The mark rule belongs to Xray's live egress only. Leaving it installed
+    # after stop/suspend can hijack netd's mobile-data setup on the next bring-up.
+    remove_mark_rule
+
     # =========================================================================
     # CLEAR IPv4 RULES
     # =========================================================================
@@ -1718,6 +1836,7 @@ clear_routing_rules() {
 
     # Down the TUN device
     $ip link set dev $TUN_NAME down
+    restore_network_sysctls
 }
 
 # ===========================================================================
@@ -1726,6 +1845,13 @@ clear_routing_rules() {
 
 start_xray() {
     if is_proc_running "xray"; then
+        if ! network_mode_allows_active; then
+            log "proxy already running on an excluded network; pausing"
+            stop_xray true
+            return 0
+        fi
+        touch "$ENABLED_FLAG"
+        rm -f "$NETWORK_PAUSED_FLAG"
         log "xray already running (pid $XRAY_PID)"
         return 0
     fi
@@ -1733,6 +1859,18 @@ start_xray() {
         log "refusing to start: $CONFIG_NAME missing or empty"
         return 1
     fi
+
+    # Keep the user's intent across a Wi-Fi/mobile handover, but do not start
+    # a proxy that cannot be used on the currently selected network. This is
+    # the battery-saving path for "Mobile Data Only" while Wi-Fi is active.
+    if ! network_mode_allows_active; then
+        touch "$NETWORK_PAUSED_FLAG"
+        touch "$ENABLED_FLAG"
+        remove_mark_rule
+        log "proxy paused: active network is outside the selected network mode"
+        return 0
+    fi
+    rm -f "$NETWORK_PAUSED_FLAG"
 
     # openxtun opens /dev/net/tun, ioctl(TUNSETIFF) into $TUN_NAME, sets
     # XRAY_TUN_FD, then execvp's into xray (same pid — exec doesn't change
@@ -1750,13 +1888,18 @@ start_xray() {
     # The upstream interface setting is saved together with the settings that
     # force a full restart, and the monitor only reacts to route events, so
     # re-pin the fwmark rule here.
-    refresh_mark_rule
+    if ! refresh_mark_rule; then
+        log "upstream route disappeared during start; pausing proxy"
+        stop_xray true
+        return 0
+    fi
     start_apps_monitor
     touch "$ENABLED_FLAG"
     return 0
 }
 
 stop_xray() {
+    local preserve_enabled="${1:-false}"
     stop_apps_monitor
     clear_routing_rules 2>/dev/null
 
@@ -1777,7 +1920,11 @@ stop_xray() {
     fi
     XRAY_PID=0
     umount_proc_with_name "xray"
-    rm -f "$ENABLED_FLAG"
+    if [ "$preserve_enabled" = true ]; then
+        touch "$ENABLED_FLAG" "$NETWORK_PAUSED_FLAG"
+    else
+        rm -f "$ENABLED_FLAG" "$NETWORK_PAUSED_FLAG"
+    fi
     log "xray stopped"
     # Save output from the last run to the log file for later retrieval by the UI.
     "$MODDIR/bin/xhuskydg_helper" logservice read -c "$LOG_CTRL" -o "$XRAY_LOG_FILE"
@@ -1798,6 +1945,17 @@ restart_xray() {
     if [ ! -s "$DATADIR/$CONFIG_NAME" ]; then
         log "refusing to reload: $CONFIG_NAME missing or empty"
         return 1
+    fi
+
+    if ! network_mode_allows_active; then
+        if is_proc_running "xray"; then
+            stop_xray true
+        else
+            touch "$ENABLED_FLAG" "$NETWORK_PAUSED_FLAG"
+            remove_mark_rule
+        fi
+        log "reload skipped: active network is outside the selected network mode"
+        return 0
     fi
 
     # Fail closed while the tun is gone (see install_tun_blackhole).
@@ -1851,6 +2009,26 @@ do_job() {
             refresh_mark_rule
             return 0
             ;;
+        network_sync)
+            if [ -f "$ENABLED_FLAG" ]; then
+                if network_mode_allows_active; then
+                    rm -f "$NETWORK_PAUSED_FLAG"
+                    if is_proc_running "xray"; then
+                        refresh_mark_rule
+                    else
+                        log "network mode now allows proxy; resuming engine"
+                        start_xray
+                    fi
+                elif is_proc_running "xray"; then
+                    log "network mode excludes active interface; pausing engine"
+                    stop_xray true
+                else
+                    touch "$NETWORK_PAUSED_FLAG"
+                    remove_mark_rule
+                fi
+            fi
+            return 0
+            ;;
         start)
             start_xray
             return 0
@@ -1867,7 +2045,9 @@ do_job() {
             # Full stop+start (rules rebuilt) with all non-xray traffic held
             # for the whole window, so nothing leaks while rules are down.
             hold_traffic
-            stop_xray
+            # Preserve the user's enabled intent if the current network mode
+            # temporarily pauses the engine during a handover.
+            stop_xray true
             start_xray || log "hard_restart: start failed"
             release_traffic
             return 0

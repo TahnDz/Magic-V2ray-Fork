@@ -275,7 +275,7 @@ function onExcludeEnabledChange(cb) {
 // restarts the engine. Pending edits are left in the draft.
 function onExcludeAutoApplyChange(cb) {
     advSettings.excludeAutoApply = cb.checked;
-    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {});
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {});
     // Switching auto-apply ON with edits already pending: apply them now.
     if (cb.checked && _exclude.dirty) _scheduleExcludeApply();
     _syncExcludeChrome();
@@ -314,7 +314,7 @@ function applyExcludeChanges() {
 
     execShell(`mkdir -p ${shQuote(DATADIR)} && chmod 700 ${shQuote(DATADIR)}`, () => {
         writeFileB64(EXCLUDE_LIST_FILE, lines.length ? lines.join('\n') + '\n' : '', () => {
-            writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+            writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
                 showToast(t('toast_settings_saved'), 'success');
                 applyActiveConfig({
                     force: true,

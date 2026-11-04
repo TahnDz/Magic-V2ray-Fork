@@ -169,7 +169,9 @@ function writeFileB64(path, content, callback) {
 }
 
 function saveProfiles() {
-    writeFileB64(PROFILES_FILE, utoa(JSON.stringify(profiles)));
+    // writeFileB64 already encodes the payload. Passing a pre-encoded value
+    // here made profiles survive only as a second layer of base64.
+    writeFileB64(PROFILES_FILE, JSON.stringify(profiles));
 }
 
 function saveActiveConfig() {
@@ -466,7 +468,7 @@ function toggleProMode(checkbox) {
     }
     updateProModeVisibility();
 
-    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
         if (on) {
             showToast(t('toast_pro_on'), 'success');
         } else {
@@ -481,9 +483,24 @@ function toggleProMode(checkbox) {
 // second monkey-patching the first at parse time; it only worked because of
 // statement ordering relative to the DOMContentLoaded listener.
 function loadState(callback) {
+    const parseStoredJson = (raw, fallback) => {
+        const text = (raw || '').trim();
+        if (!text) return fallback;
+        try {
+            return JSON.parse(decodeBase64(text));
+        } catch (firstError) {
+            // Older builds encoded settings/profiles twice. Read that format
+            // once so upgrading does not silently reset the user's state.
+            try {
+                return JSON.parse(decodeBase64(decodeBase64(text)));
+            } catch (legacyError) {
+                return fallback;
+            }
+        }
+    };
     execShell(`cat '${PROFILES_FILE}' 2>/dev/null || echo '{}'`, (profilesRaw) => {
         try {
-            const parsed = JSON.parse(decodeBase64(profilesRaw));
+            const parsed = parseStoredJson(profilesRaw, {});
             // MIGRATION PATCH: older builds stored a bare array per category.
             profiles = {};
             Object.keys(parsed).forEach(cat => {
@@ -503,9 +520,10 @@ function loadState(callback) {
 
             execShell(`cat '${SETTINGS_FILE}' 2>/dev/null || echo ''`, (settingsRaw) => {
                 if (settingsRaw.trim()) {
-                    try {
-                        advSettings = JSON.parse(decodeBase64(settingsRaw.trim()));
-                    } catch (e) {
+                    const parsedSettings = parseStoredJson(settingsRaw, null);
+                    if (parsedSettings && typeof parsedSettings === 'object' && !Array.isArray(parsedSettings)) {
+                        advSettings = parsedSettings;
+                    } else {
                         console.warn("[loadState] settings corrupt, falling back to defaults.");
                     }
                 }
@@ -2822,7 +2840,7 @@ function saveEditedSubscription() {
     // Rename category if name changed
     if (newName !== originalCat) {
         Object.keys(profiles).forEach(c => (profiles[c].nodes || []).forEach(n => { if (_isGroupNode(n) && n.pg.source === originalCat) n.pg.source = newName; }));
-        writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)));
+        writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings));
         profiles[newName] = { ...profiles[originalCat] };
         delete profiles[originalCat];
 
@@ -3682,7 +3700,7 @@ function saveAdvancedSettingsForm(isLangOnly = false) {    advSettings.loglevel 
     // advSettings.lang is only written by changeLanguage() (explicit choice);
     // persisting currentLang here would turn auto-detection into a fixed choice.
 
-    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
         if (isLangOnly) return;
         showToast(t('toast_settings_saved'), "success");
         // Nothing on this form is read by apply_routing_rules, so the
@@ -3722,7 +3740,7 @@ function saveNetworkSettingsForm() {
     advSettings.lanProxyCidrs = collectLanProxyCidrs();
     delete advSettings.includeLan;
 
-    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
         applyBypassIfaceForm(() => {
             showToast(t('toast_settings_saved'), "success");
             applyActiveConfig({ force: true });
@@ -4226,7 +4244,7 @@ function onDomainStrategyChange(select) {
 function persistRoutingRules() {
     // Any pending debounced save from moveRoutingRule() is covered by this one.
     clearTimeout(_routingPersistTimer);
-    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+    writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {
         applyActiveConfig();
     });
 }
@@ -5276,7 +5294,7 @@ function initHostsFileIfNeeded(rawFromDisk, callback) {
 
     if (advSettings && advSettings.customHosts) {
         delete advSettings.customHosts;
-        writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {});
+        writeFileB64(SETTINGS_FILE, JSON.stringify(advSettings), () => {});
     }
 
     entries.sort((a, b) => a.domain.localeCompare(b.domain));

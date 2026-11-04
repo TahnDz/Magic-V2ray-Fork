@@ -116,11 +116,19 @@ $ip link del dev "$TUN_NAME" 2>/dev/null
 # it; that mount must come off before the real value is meaningful again.
 umount /proc/sys/net/ipv4/ip_forward 2>/dev/null
 
-if [ -f "$STUB_DIR/run/sysctl.bak" ]; then
+SYSCTL_BACKUP=""
+for candidate in "$STUB_DIR/run/proxy_sysctl.bak" "$STUB_DIR/run/sysctl.bak"; do
+    if [ -f "$candidate" ]; then
+        SYSCTL_BACKUP="$candidate"
+        break
+    fi
+done
+
+if [ -n "$SYSCTL_BACKUP" ]; then
     # Lines are "<proc path> <original value>".
     while read -r path value; do
         [ -n "$path" ] && [ -w "$path" ] && echo "$value" > "$path" 2>/dev/null
-    done < "$STUB_DIR/run/sysctl.bak"
+    done < "$SYSCTL_BACKUP"
     log "restored saved sysctl values"
 else
     # No snapshot (module never started this boot, or an older build).
