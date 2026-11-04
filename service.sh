@@ -37,6 +37,7 @@ acquire_service_lock() {
     mkdir -p "$DATADIR"
     chmod 700 "$DATADIR" 2>/dev/null
     for attempt in 1 2 3 4 5; do
+        : "$attempt"
         if mkdir "$SERVICE_LOCK_DIR" 2>/dev/null; then
             printf '%s\n' "$$" > "$SERVICE_LOCK_PID"
             return 0
