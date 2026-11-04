@@ -1,0 +1,5842 @@
+function applyI18n() {
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (i18n[currentLang][key]) {
+            el.innerHTML = i18n[currentLang][key];
+        }
+    });
+    document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+        const key = el.getAttribute('data-i18n-placeholder');
+        if (i18n[currentLang][key]) {
+            el.setAttribute('placeholder', i18n[currentLang][key]);
+        }
+    });
+    document.querySelectorAll('[data-i18n-aria]').forEach(el => {
+        const key = el.getAttribute('data-i18n-aria');
+        if (i18n[currentLang][key]) {
+            el.setAttribute('aria-label', i18n[currentLang][key]);
+        }
+    });
+    document.querySelectorAll('[data-i18n-title]').forEach(el => {
+        const key = el.getAttribute('data-i18n-title');
+        if (i18n[currentLang][key]) {
+            el.setAttribute('title', i18n[currentLang][key]);
+            el.setAttribute('aria-label', i18n[currentLang][key]);
+        }
+    });
+    const select = document.getElementById('lang-select');
+    // "auto" stays selected while no language has been chosen explicitly.
+    if (select) select.value = advSettings.lang ? currentLang : 'auto';
+    document.documentElement.lang = ({ 'zh': 'zh-CN', 'zh-tw': 'zh-TW' })[currentLang] || currentLang;
+}
+
+// Maps the system / WebView locale list (navigator.languages, most preferred
+// first) onto one of the languages in i18n.js. First match wins; anything
+// unsupported falls back to English.
+function detectSystemLanguage() {
+    const list = (navigator.languages && navigator.languages.length)
+        ? navigator.languages
+        : [navigator.language || navigator.userLanguage || ''];
+    for (const raw of list) {
+        const tag = String(raw || '').toLowerCase().replace(/_/g, '-');
+        if (!tag) continue;
+        const base = tag.split('-')[0];
+        if (base === 'zh') {
+            // Traditional: zh-TW / zh-HK / zh-MO / zh-Hant-*. Everything else
+            // (zh, zh-CN, zh-SG, zh-Hans-*) is Simplified.
+            return /(^|-)(tw|hk|mo|hant)(-|$)/.test(tag) ? 'zh-tw' : 'zh';
+        }
+        if (i18n[base]) return base;
+    }
+    return 'en';
+}
+
+// Explicit choice (advSettings.lang) wins; otherwise follow the system.
+function resolveLanguage() {
+    if (advSettings.lang && i18n[advSettings.lang]) return advSettings.lang;
+    return detectSystemLanguage();
+}
+
+function t(key, variables = {}) {
+    let text = i18n[currentLang][key] || i18n['en'][key] || key;
+    Object.keys(variables).forEach(v => {
+        text = text.replace(new RegExp(`{${v}}`, 'g'), variables[v]);
+    });
+    return text;
+}
+
+function changeLanguage(lang) {
+    if (lang === 'auto') {
+        delete advSettings.lang;          // back to following the system
+        currentLang = detectSystemLanguage();
+    } else {
+        if (!i18n[lang]) return;
+        currentLang = lang;
+        advSettings.lang = lang;
+    }
+    applyI18n();
+    updateLanBypassSummary();
+    updateDnsSummary();
+    updateStatusDisplay();
+    renderProfiles();
+    saveAdvancedSettingsForm(true); 
+}
+
+function showLoading(textKey) {
+    const overlay = document.getElementById('loading-overlay');
+    const textEl = document.getElementById('loading-text');
+    if (overlay && textEl) {
+        textEl.innerHTML = (typeof t === 'function' && i18n[currentLang]?.[textKey]) ? t(textKey) : textKey;
+        overlay.style.display = 'flex';
+    }
+}
+
+async function asyncShowLoading(textKey) {
+    return new Promise((resolve) => {
+        showLoading(textKey);
+        setTimeout(resolve, 100); // Allow the UI to update
+    });
+}
+
+function hideLoading() {
+    const overlay = document.getElementById('loading-overlay');
+    if (overlay) {
+        overlay.style.display = 'none';
+    }
+}
+ 
+function execShell(command, callback) {
+    if (typeof ksu === "object" && typeof ksu.exec === "function") {
+        const cbId = `cb_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        window[cbId] = (errno, stdout, stderr) => {
+            delete window[cbId];
+            if (callback) callback(stdout.trim(), stderr.trim(), errno);
+        };
+        ksu.exec(command, "{}", cbId);
+    } else {
+        showToast("window.ksu not available", "error");
+        if (callback) callback("ERROR", "", 1);
+    }
+}
+
+function execShellAsync(cmd) {
+    return new Promise((resolve) => {
+        execShell(cmd, (output) => {
+            resolve(output ? output.trim() : "");
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Shell-safety layer.
+//
+// execShell() hands its argument to a root shell. Any value that originates
+// outside this file — a subscription payload, a node field, a category name,
+// a routing rule — is attacker-controlled and MUST NOT be interpolated into a
+// command as raw text. JSON does not escape the single quote, so a value
+// containing ' escapes single-quote wrapping and executes as root.
+//
+// Two safe primitives, and nothing else may build a command containing
+// untrusted text:
+//   shQuote(s)          - POSIX single-quote escaping, for short literals.
+//   writeFileB64(p, c)  - writes arbitrary bytes via base64, which cannot
+//                         contain a quote or metacharacter by construction.
+// ---------------------------------------------------------------------------
+
+// Wraps a value in single quotes, escaping any embedded quote as '\''.
+// Safe for any byte sequence; the result is a single shell word.
+function shQuote(str) {
+    return "'" + String(str).replace(/'/g, "'\\''") + "'";
+}
+
+// Writes `content` to `path` without ever placing it in the command line as
+// text. Base64 output is [A-Za-z0-9+/=] only, so it cannot break quoting.
+// Files are created 0600 under a 077 umask — they hold server credentials.
+function writeFileB64(path, content, callback) {
+    let encoded;
+    try {
+        encoded = utoa(String(content));
+    } catch (e) {
+        console.error('[writeFileB64] encode failed', e);
+        if (callback) callback('', String(e), 1);
+        return;
+    }
+    const p = shQuote(path);
+    execShell(
+        `umask 077; printf '%s' ${shQuote(encoded)} | base64 -d > ${p} && chmod 600 ${p}`,
+        callback || (() => {})
+    );
+}
+
+function saveProfiles() {
+    writeFileB64(PROFILES_FILE, utoa(JSON.stringify(profiles)));
+}
+
+function saveActiveConfig() {
+    if (activeConfig) {
+        writeFileB64(ACTIVE_FILE, activeConfig);
+    } else {
+        execShell(`rm -f ${shQuote(ACTIVE_FILE)}`, () => {});
+    }
+}
+
+// Builds the Xray config for a node and refuses to hand back anything that
+// would not start. convert_uri_to_xray_json() signals failure by returning a
+// JSON document with an `error` key; writing that to config.json used to
+// produce an engine that exits on launch while the routing rules stayed
+// applied — i.e. a silent total blackhole that also survived reboot.
+// Returns { ok: true, config } or { ok: false, error }.
+function resolveXrayConfigChecked(rawUri) {
+    let configStr;
+    try {
+        configStr = _resolveXrayConfig(rawUri);
+    } catch (e) {
+        return { ok: false, error: e.message || String(e) };
+    }
+    if (!configStr || typeof configStr !== 'string') {
+        return { ok: false, error: 'empty config' };
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(configStr);
+    } catch (e) {
+        return { ok: false, error: 'generated config is not valid JSON' };
+    }
+    if (parsed && parsed.error) {
+        return { ok: false, error: parsed.error };
+    }
+    if (!parsed || !Array.isArray(parsed.outbounds) || parsed.outbounds.length === 0) {
+        return { ok: false, error: 'generated config has no outbounds' };
+    }
+    return { ok: true, config: configStr };
+}
+
+// Regenerates config.json for the currently active node and restarts the
+// engine only if it is already running. Used by every "settings changed"
+// path so the write/validate/restart sequence exists in exactly one place.
+function applyActiveConfig(options = {}) {
+    const { force = false, onDone } = options;
+    // Professional mode owns config.json outright — never regenerate it from
+    // the selected node, or a settings save would silently wipe the hand
+    // written config.
+    if (advSettings.proMode) {
+        writeProConfigAndReload(customConfigText, options);
+        return;
+    }
+    // No node selected === the built-in "no proxy" node, which is always
+    // selectable and always valid, so this is a normal path rather than a
+    // bail-out.
+    let rawUri;
+    if (!activeConfig) {
+        rawUri = DIRECT_NODE_URI;
+    } else {
+        const [category, id] = activeConfig.split(':');
+        const node = profiles[category]?.nodes?.find(n => n.id === id);
+        if (!node) {
+            if (onDone) onDone(false);
+            return;
+        }
+        rawUri = node.rawUri;
+    }
+
+    const res = resolveXrayConfigChecked(rawUri);
+    if (!res.ok) {
+        showToast(t('toast_config_invalid', { reason: res.error }), 'error');
+        if (onDone) onDone(false);
+        return;
+    }
+    showLoading(t("toast_reload_xray"));
+
+    writeFileB64(CONFIG_JSON, res.config, () => {
+        if (force) {
+            execShell(`sh ${MODDIR}/proxy_control.sh restart`, () => {
+                hideLoading();
+                if (onDone) onDone(true);
+            });
+            return;
+        }
+        execShell(`sh ${MODDIR}/proxy_control.sh status`, (status) => {
+            if (status === 'running') {
+                // Node/config changed but nothing that apply_routing_rules
+                // reads did — swap the xray process only, leave the
+                // iptables/policy routing rules exactly as they are.
+                execShell(`sh ${MODDIR}/proxy_control.sh reload`, () => {
+                    hideLoading();
+                    _markStatusPending();
+                });
+            } else {
+                hideLoading();
+            }
+            if (onDone) onDone(true);
+        });
+    });
+}
+ 
+// ===== Professional mode (hand written config.json) =====
+//
+// When advSettings.proMode is on, the node pickers on the Dashboard are
+// hidden and CONFIG_JSON is whatever the user typed, written verbatim to the
+// exact file service.sh reads — no separate draft file to fall out of sync.
+// The flag lives in settings.base64 next to every other UI switch.
+
+function bindProModeToFormView() {
+    const toggle = document.getElementById('set-promode');
+    const area = document.getElementById('pro-config-input');
+    if (toggle) toggle.checked = !!advSettings.proMode;
+    if (area && !area.value) area.value = customConfigText || '';
+    updateProModeVisibility();
+}
+
+function updateProModeVisibility() {
+    const on = !!advSettings.proMode;
+    const proSec = document.getElementById('pro-config-section');
+    const importSec = document.getElementById('import-section');
+    const profSec = document.getElementById('profiles-section');
+    if (proSec) proSec.style.display = on ? 'block' : 'none';
+    if (importSec) importSec.style.display = on ? 'none' : 'block';
+    if (profSec) profSec.style.display = on ? 'none' : 'block';
+}
+
+// Structural sanity check. Only the things that make the difference between
+// "a tunnel" and "a bricked device" are hard errors; style choices are
+// warnings the user is free to ignore.
+function validateCustomConfig(text) {
+    const warnings = [];
+    const raw = (text || '').trim();
+    if (!raw) return { ok: false, error: t('pro_err_empty'), warnings };
+
+    let cfg;
+    try {
+        cfg = JSON.parse(raw);
+    } catch (e) {
+        return { ok: false, error: t('pro_err_json', { reason: e.message || String(e) }), warnings };
+    }
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+        return { ok: false, error: t('pro_err_json', { reason: 'root is not an object' }), warnings };
+    }
+
+    const inbounds = Array.isArray(cfg.inbounds) ? cfg.inbounds : [];
+    const outbounds = Array.isArray(cfg.outbounds) ? cfg.outbounds : [];
+
+    if (!outbounds.length) {
+        return { ok: false, error: t('pro_err_no_outbounds'), warnings };
+    }
+
+    const tunIn = inbounds.find(i => i && i.protocol === 'tun');
+    if (!tunIn) {
+        return { ok: false, error: t('pro_err_no_tun'), warnings };
+    }
+    if ((tunIn.settings?.name || '') !== 'xraytun0') {
+        return { ok: false, error: t('pro_err_tun_name'), warnings };
+    }
+    if (tunIn.tag !== 'tun-in') warnings.push(t('pro_warn_tun_tag'));
+
+    // Every outbound that actually dials a socket must carry fwmark 255,
+    // otherwise its own packets are caught by the tun redirect rules and
+    // loop back into Xray instead of leaving via the real interface.
+    const dialing = outbounds.filter(o => o && o.protocol !== 'blackhole' && o.protocol !== 'dns');
+    const marked = dialing.filter(o => o.streamSettings?.sockopt?.mark === 255);
+    if (dialing.length && !marked.length) {
+        return { ok: false, error: t('pro_err_no_mark'), warnings };
+    }
+    dialing.forEach(o => {
+        if (o.streamSettings?.sockopt?.mark !== 255) {
+            warnings.push(t('pro_warn_mark', { tag: o.tag || o.protocol || '?' }));
+        }
+    });
+
+    const socksIn = inbounds.find(i => i && i.protocol === 'socks' && i.tag === 'socks-test-in');
+    if (!socksIn) warnings.push(t('pro_warn_no_socks'));
+    else if (String(socksIn.port) !== '808' || socksIn.listen !== '127.17.1.3') {
+        warnings.push(t('pro_warn_socks_addr'));
+    }
+
+    if (!outbounds.some(o => o && o.tag === 'direct')) warnings.push(t('pro_warn_no_direct'));
+    if (!outbounds.some(o => o && o.tag === 'block')) warnings.push(t('pro_warn_no_block'));
+
+    const rules = cfg.routing?.rules;
+    if (!Array.isArray(rules) || !rules.length) warnings.push(t('pro_warn_no_rules'));
+    else if (!rules.some(r => r && String(r.port || '') === '53')) warnings.push(t('pro_warn_no_dns_rule'));
+
+    return { ok: true, config: JSON.stringify(cfg, null, 2), warnings };
+}
+
+function validateCustomConfigUi() {
+    const area = document.getElementById('pro-config-input');
+    const res = validateCustomConfig(area ? area.value : customConfigText);
+    if (!res.ok) {
+        showToast(t('toast_pro_invalid', { reason: res.error }), 'error');
+        return false;
+    }
+    if (res.warnings.length) {
+        showToast(res.warnings.join(' • '), 'error');
+        return true;
+    }
+    showToast(t('toast_pro_valid'), 'success');
+    return true;
+}
+
+function formatCustomConfig() {
+    const area = document.getElementById('pro-config-input');
+    if (!area) return;
+    try {
+        area.value = JSON.stringify(JSON.parse(area.value), null, 2);
+        showToast(t('toast_pro_formatted'), 'success');
+    } catch (e) {
+        showToast(t('toast_pro_invalid', { reason: e.message || String(e) }), 'error');
+    }
+}
+
+async function loadCustomConfigTemplate() {
+    const area = document.getElementById('pro-config-input');
+    if (!area) return;
+    if (area.value.trim()) {
+        const ok = await showConfirm(t('confirm_pro_template'));
+        if (!ok) return;
+    }
+    area.value = CUSTOM_CONFIG_TEMPLATE;
+}
+
+// Writes `text` straight to config.json and reloads/restarts the engine the
+// same way applyActiveConfig() does for generated configs.
+function writeProConfigAndReload(text, options = {}) {
+    const { force = false, onDone } = options;
+    const res = validateCustomConfig(text);
+    if (!res.ok) {
+        showToast(t('toast_pro_invalid', { reason: res.error }), 'error');
+        if (onDone) onDone(false);
+        return;
+    }
+    showLoading(t("toast_reload_xray"));
+    writeFileB64(CONFIG_JSON, res.config, () => {
+        if (force) {
+            execShell(`sh ${MODDIR}/proxy_control.sh restart`, () => {
+                hideLoading();
+                if (onDone) onDone(true);
+            });
+            return;
+        }
+        execShell(`sh ${MODDIR}/proxy_control.sh status`, (status) => {
+            if (status === 'running') {
+                execShell(`sh ${MODDIR}/proxy_control.sh reload`, () => {
+                    hideLoading();
+                    _markStatusPending();
+                });
+            } else {
+                hideLoading();
+            }
+            if (onDone) onDone(true);
+        });
+    });
+}
+
+function applyCustomConfig() {
+    const area = document.getElementById('pro-config-input');
+    const text = area ? area.value : customConfigText;
+    const res = validateCustomConfig(text);
+    if (!res.ok) {
+        showToast(t('toast_pro_invalid', { reason: res.error }), 'error');
+        return;
+    }
+    if (area) area.value = res.config;
+    customConfigText = res.config;
+
+    // Writes straight to CONFIG_JSON — the same file service.sh reads —
+    // there is no separate draft file to keep in sync.
+    writeProConfigAndReload(customConfigText, {
+        onDone: (ok) => {
+            if (!ok) return;
+            if (res.warnings.length) showToast(res.warnings.join(' • '), 'error');
+            else showToast(t('toast_pro_applied'), 'success');
+        }
+    });
+}
+
+// Flipping the switch only changes which editor the Dashboard shows; the
+// engine is left alone until the user presses a button that applies. The one
+// exception is turning professional mode OFF, which puts the selected node
+// back in charge of config.json straight away.
+function toggleProMode(checkbox) {
+    const on = !!checkbox.checked;
+    advSettings.proMode = on;
+
+    const area = document.getElementById('pro-config-input');
+    if (on && area && !area.value.trim()) {
+        area.value = customConfigText || CUSTOM_CONFIG_TEMPLATE;
+    }
+    updateProModeVisibility();
+
+    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+        if (on) {
+            showToast(t('toast_pro_on'), 'success');
+        } else {
+            showToast(t('toast_pro_off'), 'success');
+            if (activeConfig) applyActiveConfig();
+        }
+    });
+}
+
+// Loads profiles, the active-node pointer and advanced settings, in that
+// order, then binds the settings form. This used to be two functions, the
+// second monkey-patching the first at parse time; it only worked because of
+// statement ordering relative to the DOMContentLoaded listener.
+function loadState(callback) {
+    execShell(`cat '${PROFILES_FILE}' 2>/dev/null || echo '{}'`, (profilesRaw) => {
+        try {
+            const parsed = JSON.parse(decodeBase64(profilesRaw));
+            // MIGRATION PATCH: older builds stored a bare array per category.
+            profiles = {};
+            Object.keys(parsed).forEach(cat => {
+                if (Array.isArray(parsed[cat])) {
+                    profiles[cat] = { url: cat === "Manual" ? null : cat, nodes: parsed[cat] };
+                } else {
+                    profiles[cat] = parsed[cat];
+                }
+            });
+        } catch (e) {
+            console.warn("[loadState] profiles parse error, reset to {}");
+            profiles = {};
+        }
+
+        execShell(`cat '${ACTIVE_FILE}' 2>/dev/null || echo ''`, (activeRaw) => {
+            activeConfig = activeRaw.trim() || null;
+
+            execShell(`cat '${SETTINGS_FILE}' 2>/dev/null || echo ''`, (settingsRaw) => {
+                if (settingsRaw.trim()) {
+                    try {
+                        advSettings = JSON.parse(decodeBase64(settingsRaw.trim()));
+                    } catch (e) {
+                        console.warn("[loadState] settings corrupt, falling back to defaults.");
+                    }
+                }
+                execShell(`cat '${CONFIG_JSON}' 2>/dev/null || echo ''`, (configRaw) => {
+                    customConfigText = (configRaw || '').trim();
+                    execShell(`cat '${HOSTS_FILE}' 2>/dev/null || echo ''`, (hostsRaw) => {
+                        initHostsFileIfNeeded(hostsRaw || '', (finalText) => {
+                            hostsFileText = finalText;
+                            bindSettingsToFormView();
+                            if (callback) callback();
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadState(() => {
+        applyI18n();
+        updateStatusDisplay();
+        renderProfiles();
+    });
+});
+ 
+// Name of the node the service is (or will be) running with, for the status
+// chip. Mirrors the resolution order used when the config is generated:
+// professional mode > built-in direct node > selected profile node.
+function getActiveNodeLabel() {
+    if (advSettings.proMode) return t('status_node_pro');
+    if (!activeConfig) return t('builtin_direct_name');
+    const sep = activeConfig.indexOf(':');
+    const category = activeConfig.slice(0, sep);
+    const id = activeConfig.slice(sep + 1);
+    const node = profiles[category]?.nodes?.find(n => n.id === id);
+    return node ? (node.name || node.address || id) : '';
+}
+
+// Rebuilt with textContent (never innerHTML): node names come from
+// subscriptions and are untrusted.
+function _setStatusBadge(text, nodeName) {
+    const badge = document.getElementById('service-status');
+    if (!badge) return;
+    badge.textContent = '';
+    const textEl = document.createElement('span');
+    textEl.className = 'status-text';
+    textEl.textContent = text;
+    badge.appendChild(textEl);
+    if (nodeName) {
+        const nodeEl = document.createElement('span');
+        nodeEl.className = 'status-node';
+        nodeEl.textContent = nodeName;
+        badge.appendChild(nodeEl);
+        badge.title = nodeName;
+    } else {
+        badge.removeAttribute('title');
+    }
+}
+
+function _clearStatusIp() {
+    const el = document.getElementById('status-ip');
+    if (!el) return;
+    el.hidden = true;
+    el.textContent = '';
+    el.classList.remove('error');
+}
+
+function updateStatusDisplay() {
+    execShell(`sh ${MODDIR}/proxy_control.sh status`, (status, stderr, errno) => {
+        const badge = document.getElementById('service-status');
+        const s = status || 'stopped';
+        _setStatusBadge(
+            t('status_prefix') + s.toUpperCase(),
+            errno === 0 ? getActiveNodeLabel() : ''
+        );
+        badge.className = `status-badge ${errno === 0 ? 'active' : 'inactive'}`;
+        // A previously fetched IP may no longer be valid after a
+        // start/stop/node switch.
+        _clearStatusIp();
+        if (errno == 2) {
+            showToast(t('toast_xray_core_crash'), "error");
+        }
+    });
+}
+
+// Tap on the status chip: ask icanhazip.com which IP we currently exit from,
+// through the running service's socks-test-in inbound. Tapping again
+// re-checks (useful right after switching node).
+let _statusIpBusy = false;
+async function showCurrentIp() {
+    if (_statusIpBusy) return;
+    const el = document.getElementById('status-ip');
+    const badge = document.getElementById('service-status');
+    if (!el || !badge) return;
+
+    if (!badge.classList.contains('active')) {
+        showToast(t('status_ip_not_running'), 'error');
+        return;
+    }
+    await asyncShowLoading(t('status_ip_checking'));
+
+    _statusIpBusy = true;
+    el.hidden = false;
+    el.classList.remove('error');
+    el.textContent = t('status_ip_checking');
+    try {
+        const out = await execShellAsync(
+            `${MODDIR}/bin/curl --socks5-hostname 127.17.1.3:808 -s ` +
+            `--max-time 6 https://icanhazip.com 2>/dev/null`
+        );
+        const ip = out.trim();
+        if (/^[0-9a-fA-F:.]{3,45}$/.test(ip)) {
+            el.textContent = t('status_ip_label') + ip;
+        } else {
+            el.classList.add('error');
+            el.textContent = t('status_ip_failed');
+        }
+    } finally {
+        _statusIpBusy = false;
+        hideLoading();
+    }
+}
+ 
+function _markStatusPending() {
+    const badge = document.getElementById('service-status');
+    if (!badge) return;
+    _setStatusBadge(t('status_loading'), '');
+    badge.className = 'status-badge active';
+    _clearStatusIp();
+    setTimeout(updateStatusDisplay, 1200);
+}
+
+// Only these verbs may be forwarded to proxy_control.sh. `action` reaches us
+// from inline handlers, so it is validated against a fixed list rather than
+// interpolated straight into the command.
+const PROXY_CONTROL_ACTIONS = [
+    'start', 'stop', 'restart', 'reload', 'status', 'reapply',
+    'start_monitor_latency', 'stop_monitor_latency', 'reset_mobile_network',
+    'gateway_start', 'gateway_stop', 'gateway_status'
+];
+
+async function toggleService(action) {
+    if (action === 'start' || action === 'restart') {
+        if (advSettings.proMode) {
+            const check = validateCustomConfig(customConfigText);
+            if (!check.ok) {
+                showToast(t('toast_pro_invalid', { reason: check.error }), "error");
+                return;
+            }
+        }
+        // No `!activeConfig` guard any more: an empty selection is the
+        // built-in no-proxy node, which produces a perfectly startable
+        // router-only config.
+        showLoading(t("toast_reload_xray"));
+        // Re-apply the mark rule for the live interface first, and only start
+        // once that has actually completed — this used to be fire-and-forget,
+        // racing the engine start against the routing rule it depends on.
+        execShell(`sh ${MODDIR}/proxy_control.sh reapply`, () => {
+            applyActiveConfig({
+                force: true,
+                onDone: (ok) => { if (ok) _markStatusPending(); }
+            });
+        });
+        hideLoading();
+        return;
+    }
+    if (!PROXY_CONTROL_ACTIONS.includes(action)) {
+        console.error('[toggleService] refusing unknown action:', action);
+        return;
+    }
+    execShell(`sh ${MODDIR}/proxy_control.sh ${action}`, () => {
+        _markStatusPending();
+    });
+}
+
+const extractUrisFromText = (text) => {
+    let uris = [];
+    const rawLines = text.split(/\r?\n/);
+
+    rawLines.forEach(line => {
+        let trimmedLine = line.trim();
+        if (!trimmedLine) return;
+
+        if (trimmedLine.startsWith('{') && trimmedLine.endsWith('}')) {
+            // It must be one line
+            try {
+                const parsedObj = JSON.parse(trimmedLine);
+                uris.push(convert_outbound_to_uri(parsedObj));
+            } catch (e) {
+                console.warn("Cannot parse JSON:", trimmedLine);
+                console.warn(e);
+            };
+        } else if (!trimmedLine.includes('://') && /^[A-Za-z0-9+/=]+$/.test(trimmedLine)) {
+            try {
+                const decoded = decodeBase64(trimmedLine);
+                if (decoded) {
+                    uris = uris.concat(extractUrisFromText(decoded));
+                }
+            } catch (e) {
+                console.warn("Line looks like Base64 but failed to decode safely:", trimmedLine);
+            }
+        } else if (trimmedLine.includes('://')) {
+            // Accept known proxy protocol schemes
+            if (/^(vmess|vless|trojan|ss|shadowsocks|wireguard|wg|hysteria2|hy2|masque|socks|socks5|http):\/\//i.test(trimmedLine)) {
+                uris.push(trimmedLine);
+            }
+        }
+    });
+    return uris;
+};
+ 
+function processImport() {
+    const input = document.getElementById('import-input').value.trim();
+    if (!input) return showToast(t('toast_empty_import'), "error");
+
+    if (input.startsWith('http://') || input.startsWith('https://')) {
+        let domain;
+        try {
+            domain = new URL(input).hostname;
+        } catch (e) {
+            return showToast(t('toast_invalid_sub'), "error");
+        }
+        fetchSubscription(domain, input);
+    } else {
+        const xrayConfigs = extractUrisFromText(input);
+        parseAndAppendNodes("Manual", xrayConfigs, null);
+    }
+
+    document.getElementById('import-input').value = "";
+}
+
+async function fetchSubscription(category, url, isReload = false) {
+    const status = await execShellAsync(`sh ${MODDIR}/proxy_control.sh status`);
+    const viaProxy = (status === 'running') ? "--socks5-hostname 127.17.1.3:808" : "";
+
+    // Certificate validation is ON by default. It used to be disabled
+    // unconditionally (-k), which let any on-path attacker substitute the
+    // subscription body — and subscription content reaches a root shell.
+    // Hosts with a self-signed certificate can opt out per subscription.
+    const allowInsecure = profiles[category]?.insecure === true;
+    const tlsArgs = allowInsecure ? "-k" : "";
+    if (allowInsecure) {
+        showToast(t('toast_sub_insecure_warn'), 'info');
+    }
+
+    await asyncShowLoading(`${t("toast_fetch_sub")}${category}...`);
+
+    const userAgent = (profiles[category]?.useragent || "").trim() || DEFAULT_SUB_USERAGENT;
+
+    const cmd = `${MODDIR}/bin/curl ${viaProxy} ${tlsArgs} -sSL -f --max-redirs 3 ` +
+                `-A ${shQuote(userAgent)} ` +
+                `--proto '=http,https' --proto-redir '=http,https' ` +
+                `--max-time 15 ${shQuote(url)}`;
+
+    execShell(cmd, (res) => {
+        hideLoading();
+
+        if (!res || res.trim() === "") {
+            return showToast(t('toast_fetch_failed'), "error");
+        }
+        if (res.includes("Failed to connect") || res.includes("Could not resolve")) {
+            return showToast(t('toast_fetch_reason') + res.split('\n')[0], "error");
+        }
+
+        // A subscription body is either a plain URI list or one big base64
+        // blob wrapping that list.
+        let parsedContent = res.trim();
+        const cleanRes = parsedContent.replace(/[\s\r\n]+/g, '');
+        if (/^[A-Za-z0-9+/=_-]+$/.test(cleanRes)) {
+            const decodedAll = tryDecodeBase64(cleanRes);
+            if (decodedAll && decodedAll.includes('://')) {
+                parsedContent = decodedAll;
+            }
+        }
+
+        parseAndAppendNodes(category, extractUrisFromText(parsedContent), url, isReload);
+    });
+}
+ 
+function buildNodeKey(node) {
+    if (node.protocol === 'vmess') {
+        try {
+            const b64 = (node.rawUri || '').substring('vmess://'.length).split('#')[0].trim();
+            const obj = JSON.parse(decodeBase64(b64));
+            delete obj.ps;
+            return 'vmess|' + JSON.stringify(obj, Object.keys(obj).sort());
+        } catch (e) {
+            return ['vmess', node.address, node.port, node.uuid, node.security].join('|');
+        }
+    }
+    const rawNoFragment = (node.rawUri || '').replace(/#.*$/, '');
+    return [
+        node.protocol || '',
+        node.address  || '',
+        node.port     || '',
+        node.uuid     || '',
+        node.security || '',
+        rawNoFragment
+    ].join('|');
+}
+
+function parseAndAppendNodes(category, xrayConfigs, url = null, isReload = false) {
+    if (!Array.isArray(xrayConfigs) || xrayConfigs.length === 0) {
+        return showToast(t('toast_no_configs_extracted'), "error");
+    }
+
+    if (isReload && profiles[category]) {
+        profiles[category].nodes = [];
+    }
+
+    if (!profiles[category]) {
+        profiles[category] = { url: url, nodes: [] };
+    } else if (url) {
+        profiles[category].url = url;
+    }
+ 
+    let importedCount = 0;
+    const shouldDedup = profiles[category].dedup !== false; // default true
+    const existingKeys = shouldDedup
+        ? new Set(profiles[category].nodes.map(n => buildNodeKey(n)))
+        : null;
+    xrayConfigs.forEach(line => {
+        const parsedNode = parseProxyUri(line);
+        if (parsedNode) {
+            const duplicate = shouldDedup && existingKeys.has(buildNodeKey(parsedNode));
+            if (!duplicate) {
+                profiles[category].nodes.push(parsedNode);
+                if (shouldDedup) existingKeys.add(buildNodeKey(parsedNode));
+                importedCount++;
+            }
+        }
+    });
+
+    if (isReload) {
+        showToast(t('toast_reload_success', { count: profiles[category].nodes.length, cat: category }), "success");
+        if (activeConfig && activeConfig.startsWith(category + ':')) {
+            const [_, currentId] = activeConfig.split(':');
+            const stillExists = profiles[category].nodes.some(n => n.id === currentId);
+            if (!stillExists) {
+                activeConfig = null;
+                saveActiveConfig();
+            }
+        }
+    } else {
+        if (importedCount === 0) {
+            showToast(t('toast_no_new_configs'), "info");
+        } else {
+            showToast(t('toast_imported_count', { count: importedCount, cat: category }), "info");
+        }
+    }
+ 
+    saveProfiles();
+    renderProfiles();
+    _refreshIfPolicyGroupsUsed();
+}
+
+function reloadCategory(category) {
+    const catData = profiles[category];
+    if (!catData || !catData.url) {
+        return showToast(t('toast_no_sub_url'), "info");
+    }
+    fetchSubscription(category, catData.url, true);
+}
+ 
+function parseProxyUri(uri) {
+    try {
+        uri = uri.trim();
+        // Normalize once, up front: a bare (un-bracketed) IPv6 host, e.g.
+        // "vless://uuid@2606:4700::1:443", is invalid per RFC 3986 and the
+        // WHATWG URL parser rejects it outright. From here on `uri` (and
+        // therefore every `rawUri` we persist below) is the corrected,
+        // properly-bracketed form — the fix lives in the stored URI itself,
+        // not just in a transient copy used for parsing.
+        uri = normalizeUriIPv6Host(uri);
+        const protocolMatch = uri.match(/^([^:]+):\/\//);
+        if (!protocolMatch) return null;
+        const protocol = protocolMatch[1].toLowerCase();
+        if (!['vless', 'vmess', 'trojan', 'ss', 'shadowsocks', 'wireguard', 'wg', 'hysteria2', 'hy2', 'masque', 'socks', 'socks5', 'http'].includes(protocol)) return null;
+
+        // vmess uses a base64-encoded JSON payload — parse it differently
+        if (protocol === 'vmess') {
+            const base64Part = uri.substring('vmess://'.length).split('#')[0].trim();
+            let name = "Unnamed Node";
+            const hashIdx = uri.lastIndexOf('#');
+            if (hashIdx !== -1) {
+                try { name = decodeURIComponent(uri.substring(hashIdx + 1)).trim(); } catch (e) {}
+            }
+            try {
+                const rawJson = decodeBase64(base64Part);
+                const c = JSON.parse(rawJson);
+                if (!c.add || !c.port || !c.id) return null;
+                if (c.ps) name = c.ps;
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'vmess',
+                    address: c.add,
+                    port: String(c.port),
+                    uuid: c.id,
+                    security: c.tls || "none",
+                    rawUri: uri
+                };
+            } catch (e) {
+                console.error("[parseProxyUri] vmess base64/JSON parse error:", e, uri);
+                return null;
+            }
+        }
+
+        // Shadowsocks: ss://base64(method:password)@host:port#name
+        // or          ss://method:password@host:port#name
+        if (protocol === 'ss' || protocol === 'shadowsocks') {
+            try {
+                let remaining = uri.substring(uri.indexOf('://') + 3);
+                let name = "Unnamed Node";
+                if (remaining.includes('#')) {
+                    const hashIdx = remaining.lastIndexOf('#');
+                    try { name = decodeURIComponent(remaining.substring(hashIdx + 1)).trim(); } catch(e) {}
+                    remaining = remaining.substring(0, hashIdx);
+                }
+                // Remove plugin params (?plugin=...)
+                const qIdx = remaining.indexOf('?');
+                if (qIdx !== -1) remaining = remaining.substring(0, qIdx);
+
+                let method = "aes-256-gcm", password = "", address = "", port = "8388";
+                const atIdx = remaining.lastIndexOf('@');
+                if (atIdx !== -1) {
+                    const userPart = remaining.substring(0, atIdx);
+                    const hostPart = remaining.substring(atIdx + 1);
+                    // Try base64 decode userPart
+                    let decoded = null;
+                    try { decoded = decodeBase64(userPart); } catch(e) {}
+                    if (decoded && decoded.includes(':')) {
+                        const ci = decoded.indexOf(':');
+                        method = decoded.substring(0, ci);
+                        password = decoded.substring(ci + 1);
+                    } else if (userPart.includes(':')) {
+                        const ci = userPart.indexOf(':');
+                        method = decodeURIComponent(userPart.substring(0, ci));
+                        password = decodeURIComponent(userPart.substring(ci + 1));
+                    }
+                    const lastColon = hostPart.lastIndexOf(':');
+                    address = unwrapIPv6(hostPart.substring(0, lastColon));
+                    port = hostPart.substring(lastColon + 1);
+                } else {
+                    // Entire remaining is base64
+                    let decoded = null;
+                    try { decoded = decodeBase64(remaining); } catch(e) {}
+                    if (decoded) {
+                        const atI = decoded.lastIndexOf('@');
+                        if (atI !== -1) {
+                            const u = decoded.substring(0, atI);
+                            const h = decoded.substring(atI + 1);
+                            const ci = u.indexOf(':');
+                            if (ci !== -1) { method = u.substring(0, ci); password = u.substring(ci + 1); }
+                            const lc = h.lastIndexOf(':');
+                            address = unwrapIPv6(h.substring(0, lc)); port = h.substring(lc + 1);
+                        }
+                    }
+                }
+                if (!address) return null;
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'shadowsocks',
+                    address,
+                    port,
+                    uuid: password,
+                    security: method,
+                    rawUri: uri
+                };
+            } catch(e) { return null; }
+        }
+
+        // WireGuard: wireguard://secretKey@host:port?publickey=...&...#name
+        if (protocol === 'wireguard' || protocol === 'wg') {
+            try {
+                const fixedUri = uri.replace(/^(wg|wireguard):\/\//i, 'https://');
+                const u = new URL(fixedUri);
+                const p = new URLSearchParams(u.search);
+                const name = u.hash ? decodeURIComponent(u.hash.substring(1)) : "WireGuard";
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'wireguard',
+                    address: unwrapIPv6(u.hostname),
+                    port: u.port || "443",
+                    uuid: u.username ? decodeURIComponent(u.username) : "",
+                    security: "none",
+                    rawUri: uri
+                };
+            } catch(e) { return null; }
+        }
+
+        // Hysteria2: hysteria2://password@host:port?...#name
+        if (protocol === 'hysteria2' || protocol === 'hy2') {
+            try {
+                const fixedUri = uri.replace(/^(hy2|hysteria2):\/\//i, 'https://');
+                const u = new URL(fixedUri);
+                const p = new URLSearchParams(u.search);
+                const name = u.hash ? decodeURIComponent(u.hash.substring(1)) : "Hysteria2";
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'hysteria2',
+                    address: unwrapIPv6(u.hostname),
+                    port: u.port || "443",
+                    uuid: decodeURIComponent(u.username),
+                    security: "tls",
+                    hy2ObfsPassword: p.get('obfs-password') || p.get('obfsPassword') || "",
+                    rawUri: uri
+                };
+            } catch(e) { return null; }
+        }
+
+        // MASQUE: masque://[user[:pass]@]host:port?...#name
+        if (protocol === 'masque') {
+            try {
+                const u = new URL(uri.replace(/^masque:\/\//i, 'https://'));
+                const name = u.hash ? decodeURIComponent(u.hash.substring(1)) : "MASQUE";
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'masque',
+                    address: unwrapIPv6(u.hostname),
+                    port: u.port || "443",
+                    uuid: "",
+                    security: "tls",
+                    rawUri: uri
+                };
+            } catch(e) { return null; }
+        }
+
+        // SOCKS / SOCKS5: socks5://user:pass@host:port#name
+        if (protocol === 'socks' || protocol === 'socks5') {
+            try {
+                const fixedUri = uri.replace(/^(socks5|socks):\/\//i, 'https://');
+                const u = new URL(fixedUri);
+                const name = u.hash ? decodeURIComponent(u.hash.substring(1)) : "SOCKS";
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'socks',
+                    address: unwrapIPv6(u.hostname),
+                    port: u.port || "443",
+                    uuid: u.username ? decodeURIComponent(u.username) : "",
+                    security: "none",
+                    rawUri: uri
+                };
+            } catch(e) { return null; }
+        }
+
+        // HTTP proxy: http://user:pass@host:port#name
+        if (protocol === 'http') {
+            try {
+                const u = new URL(uri);
+                const name = u.hash ? decodeURIComponent(u.hash.substring(1)) : "HTTP Proxy";
+                return {
+                    id: Math.random().toString(36).substr(2, 9),
+                    name,
+                    protocol: 'http',
+                    address: unwrapIPv6(u.hostname),
+                    port: u.port || "8080",
+                    uuid: u.username ? decodeURIComponent(u.username) : "",
+                    security: "none",
+                    rawUri: uri
+                };
+            } catch(e) { return null; }
+        }
+
+        // vless / trojan use standard user@host:port?params format
+        let remaining = uri.substring(protocol.length + 3);
+ 
+        let name = "Unnamed Node";
+        if (remaining.includes('#')) {
+            const hashIdx = remaining.lastIndexOf('#');
+            name = decodeURIComponent(remaining.substring(hashIdx + 1)).trim();
+            remaining = remaining.substring(0, hashIdx);
+        }
+ 
+        const atIndex = remaining.lastIndexOf('@');
+        if (atIndex === -1) return null;
+ 
+        const uuid = remaining.substring(0, atIndex);
+        const hostAndParams = remaining.substring(atIndex + 1);
+ 
+        const hostBlock = hostAndParams.split('?')[0];
+        let address = hostBlock;
+        let port = "443";
+ 
+        if (hostBlock.startsWith('[')) {
+            const bracketEnd = hostBlock.indexOf(']');
+            address = unwrapIPv6(hostBlock.substring(0, bracketEnd + 1));
+            if (hostBlock[bracketEnd + 1] === ':') {
+                port = hostBlock.substring(bracketEnd + 2);
+            }
+        } else if (hostBlock.includes(':')) {
+            const lastColon = hostBlock.lastIndexOf(':');
+            address = hostBlock.substring(0, lastColon);
+            port = hostBlock.substring(lastColon + 1);
+        }
+ 
+        let security = "none";
+        const secMatch = hostAndParams.match(/[?&]security=([^&]+)/);
+        if (secMatch) security = secMatch[1];
+ 
+        return {
+            id: Math.random().toString(36).substr(2, 9),
+            name,
+            protocol,
+            address,
+            port,
+            uuid,
+            security,
+            rawUri: uri
+        };
+    } catch (e) {
+        console.error("[parseProxyUri] error:", e, uri);
+        return null;
+    }
+}
+
+// Routing rules may target a saved node by its remark instead of
+// proxy/direct/block. _collectRouteNodeUris() returns { remark: rawUri } for
+// every such node used by an enabled rule (first node with that remark wins, in
+// profile order - the same order the rule editor lists them). helper.js turns
+// these into extra outbounds.
+const ROUTING_BUILTIN_TAGS_UI = ['proxy', 'direct', 'block'];
+
+function _nodeRemark(node) {
+    return (node && (node.name || node.address)) || '';
+}
+
+function _findNodeByRemark(remark) {
+    for (const category of Object.keys(profiles)) {
+        const node = (profiles[category]?.nodes || []).find(n => !_isGroupNode(n) && _nodeRemark(n) === remark);
+        if (node) return node;
+    }
+    return null;
+}
+
+function _collectRouteNodeUris() {
+    const map = {};
+    (advSettings.routingRules || []).forEach(r => {
+        if (!r || r.enabled === false) return;
+        const remark = r.outboundTag;
+        if (!remark || ROUTING_BUILTIN_TAGS_UI.includes(remark) || remark in map) return;
+        if (remark.indexOf(POLICY_GROUP_PREFIX) === 0) return; // handled by _collectPolicyGroupsResolved()
+        const node = _findNodeByRemark(remark);
+        if (node && node.rawUri) map[remark] = node.rawUri;
+    });
+    return map;
+}
+
+function _resolveXrayConfig(rawUri) {
+    // A copy, so routeNodeUris never leaks into the persisted advSettings.
+    const genSettings = Object.assign({}, advSettings, {
+        routeNodeUris: _collectRouteNodeUris(),
+        policyGroupsResolved: _collectPolicyGroupsResolved()
+    });
+    let config_json = {};
+    // An active policy group: the base config is built from its first member
+    // (that node becomes the `proxy` outbound / fallback) and helper.js then
+    // points every "proxy" rule at the group's balancer.
+    if (rawUri && rawUri.startsWith('pgroup://')) {
+        const gid = rawUri.slice('pgroup://'.length);
+        const g = _findPolicyGroup(gid);
+        const members = g ? _policyGroupNodes(g) : [];
+        if (!members.length) throw new Error(t('toast_pg_empty'));
+        genSettings.policyGroupsResolved = _collectPolicyGroupsResolved(gid);
+        genSettings.activeGroupId = gid;
+        rawUri = members[0].rawUri;
+    }
+    if (rawUri && rawUri.startsWith('chain://')) {
+        const fakeRawUri = rawUri.replace(/^chain:\/\//i, 'https://');
+        const u = new URL(fakeRawUri);
+        const hop1Uri = u.searchParams.get('hop1') || '';
+        const hop2Uri = u.searchParams.get('hop2') || '';
+        config_json = convert_chain_uris_to_xray_json(hop1Uri, hop2Uri, genSettings);
+    } else {
+        config_json = convert_uri_to_xray_json(rawUri, genSettings);
+    }
+    return config_json;
+}
+
+async function selectNode(category, id) {
+    const node = profiles[category]?.nodes?.find(n => n.id === id);
+    if (!node) return;
+ 
+    // Reject a node whose config cannot be generated *before* making it
+    // active — otherwise the next start writes an unusable config.json,
+    // xray exits, and the routing rules blackhole the device.
+    const res = resolveXrayConfigChecked(node.rawUri);
+    if (!res.ok) {
+        showToast(t('toast_config_invalid', { reason: res.error }), 'error');
+        return;
+    }
+
+    // Plaintext VLESS (no TLS/REALITY, no VLESS Encryption): swap the usual
+    // confirmation for an explicit warning, so it is a deliberate choice.
+    const nodeName = node.name || node.address || id;
+    const confirmed = isPlainVlessUri(node.rawUri)
+        ? await showConfirm(t('warn_plain_vless', { name: nodeName }), { okText: t('warn_plain_vless_ok') })
+        : await showConfirm(t('confirm_connect_node', { name: nodeName }));
+    if (!confirmed) return;
+
+    activeConfig = `${category}:${id}`;
+    saveActiveConfig();
+    renderProfiles();
+
+    // Write the config and restart only if the engine is already running.
+    applyActiveConfig();
+}
+ 
+// Selecting the built-in node simply clears the node pointer: activeConfig
+// null is what every other code path already treats as "nothing selected",
+// and applyActiveConfig() turns it into the router-only config.
+async function selectDirectNode() {
+    if (!activeConfig) return;
+    const confirmed = await showConfirm(t('confirm_connect_direct'));
+    if (!confirmed) return;
+
+    activeConfig = null;
+    saveActiveConfig();
+    renderProfiles();
+    applyActiveConfig();
+}
+
+function removeCategory(category) {
+    delete profiles[category];
+    _refreshIfPolicyGroupsUsed();
+    if (activeConfig && activeConfig.startsWith(category + ':')) {
+        activeConfig = null;
+        saveActiveConfig();
+    }
+    saveProfiles();
+    renderProfiles();
+}
+ 
+// Builds a <button> whose handler is attached as a function reference.
+// Category names and node fields come from subscriptions and free-text user
+// input; interpolating them into an onclick="" attribute (as this used to do)
+// let a name containing a double quote break out of the attribute and inject
+// script into a page that holds a root exec bridge.
+function _mkButton(label, className, handler) {
+    const btn = document.createElement('button');
+    if (className) btn.className = className;
+    btn.textContent = label;
+    btn.addEventListener('click', handler);
+    return btn;
+}
+
+// The pinned built-in node. Rendered outside any category, always first, and
+// deliberately without the ⋮ menu: there is nothing to edit, copy, delete or
+// latency-test on a node that never leaves the local network.
+function _mkDirectNodeItem() {
+    const isSelected = !activeConfig;
+    const item = document.createElement('div');
+    item.className = `config-item builtin-node${isSelected ? ' selected' : ''}`;
+
+    const info = document.createElement('div');
+    info.className = 'config-info';
+    info.style.cssText = "flex: 1; display: flex; flex-direction: column;";
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'config-name';
+    nameEl.textContent = t('builtin_direct_name');
+
+    const metaEl = document.createElement('div');
+    metaEl.className = 'config-meta';
+    metaEl.textContent = t('builtin_direct_meta');
+
+    info.appendChild(nameEl);
+    info.appendChild(metaEl);
+    info.addEventListener('click', () => selectDirectNode());
+    item.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'node-actions-container';
+    if (isSelected) {
+        const pin = document.createElement('span');
+        pin.textContent = '📌';
+        actions.appendChild(pin);
+    }
+    item.appendChild(actions);
+    return item;
+}
+
+function renderProfiles() {
+    _migrateLegacyPolicyGroups();
+    const container = document.getElementById('profiles-container');
+    container.innerHTML = "";
+    container.appendChild(_mkDirectNodeItem());
+    const categories = Object.keys(profiles).filter(c => profiles[c]?.nodes?.length > 0 || profiles[c]?.custom);
+    if (categories.length === 0) {
+        const p = document.createElement('p');
+        p.style.cssText = "color: var(--text-muted); font-size:14px; text-align:center; padding: 24px 0;";
+        p.innerHTML = t('no_configs');
+        container.appendChild(p);
+        return;
+    }
+    for (const category of categories) {
+        const group = document.createElement('div');
+        group.className = "category-group";
+        const hasUrl = !!profiles[category].url;
+        const isExpanded = categoryExpandedState[category] || false;
+
+        const header = document.createElement('div');
+        header.className = 'category-header';
+        header.style.cssText = "position: relative; display: flex; justify-content: space-between; align-items: center;";
+
+        const title = document.createElement('strong');
+        title.textContent = `${category} (${profiles[category].nodes.length})`;
+        header.appendChild(title);
+
+        const menuWrap = document.createElement('div');
+        menuWrap.className = 'category-menu-container';
+        menuWrap.style.cssText = "display: flex; align-items: center; gap: 8px;";
+
+        const expandBtn = _mkButton(isExpanded ? "▽" : "▷", 'btn-menu-trigger',
+            (e) => toggleCategoryExpand(e, category));
+        expandBtn.style.cssText = "font-weight: bold; width: 28px;";
+        menuWrap.appendChild(expandBtn);
+
+        const kebab = _mkButton("⋮", 'btn-menu-trigger', function (e) { toggleCategoryMenu(e, this); });
+        menuWrap.appendChild(kebab);
+
+        const dropdown = document.createElement('div');
+        dropdown.className = 'category-dropdown-menu';
+        if (hasUrl) {
+            dropdown.appendChild(_mkButton(t('menu_reload'), '',
+                () => { reloadCategory(category); closeAllMenus(); }));
+        }
+        dropdown.appendChild(_mkButton(t('menu_edit_sub'), '',
+            () => { openEditSubModal(category); closeAllMenus(); }));
+        dropdown.appendChild(_mkButton(t('menu_deduplicate'), '',
+            () => { deduplicateCategory(category); closeAllMenus(); }));
+        dropdown.appendChild(_mkButton(t('menu_check_http'), 'btn-ping-category',
+            (e) => checkHttpWithClose(e, category)));
+        dropdown.appendChild(_mkButton(t('menu_check_ip'), 'btn-ping-category',
+            (e) => checkIpWithClose(e, category)));
+        dropdown.appendChild(_mkButton(t('menu_delete'), 'btn-delete-item',
+            () => { removeCategory(category); closeAllMenus(); }));
+        menuWrap.appendChild(dropdown);
+
+        header.appendChild(menuWrap);
+        group.appendChild(header);
+
+        const listNode = document.createElement('div');
+        listNode.className = 'nodes-list';
+        listNode.style.display = isExpanded ? "block" : "none";
+        group.appendChild(listNode);
+        profiles[category].nodes.forEach(node => {
+            const isSelected = activeConfig === `${category}:${node.id}`;
+            const isChain = node.protocol === 'chain';
+            const item = document.createElement('div');
+            item.className = `config-item${isSelected ? ' selected' : ''}`;
+
+            // Chain nodes show hop labels instead of address:port
+            const isGroup = _isGroupNode(node);
+            let metaLine;
+            if (isGroup) {
+                const g = _findPolicyGroup(node.id);
+                metaLine = g ? _policyGroupMeta(g) : '';
+            } else if (isChain) {
+                try {
+                    const fakeRawUri = node.rawUri.replace(/^chain:\/\//i, 'https://');
+                    const u = new URL(fakeRawUri);
+                    const hop1Uri = u.searchParams.get('hop1') || '';
+                    const hop2Uri = u.searchParams.get('hop2') || '';
+                    const proto1 = hop1Uri.split('://')[0].toUpperCase();
+                    const proto2 = hop2Uri.split('://')[0].toUpperCase();
+                    metaLine = `⛓ CHAIN: ${proto1} → ${proto2}`;
+                } catch(e) {
+                    metaLine = '⛓ CHAIN';
+                }
+            } else {
+                // Assigned via textContent below, so no manual escaping here.
+                metaLine = `${(node.protocol || '').toUpperCase()} | ${bracketIPv6(node.address)}:${node.port}`;
+            }
+
+            const info = document.createElement('div');
+            info.className = 'config-info';
+            info.style.cssText = "flex: 1; display: flex; flex-direction: column;";
+            const nameEl = document.createElement('div');
+            nameEl.className = 'config-name';
+            nameEl.textContent = node.name;
+            const metaEl = document.createElement('div');
+            metaEl.className = 'config-meta';
+            metaEl.textContent = metaLine;
+            info.appendChild(nameEl);
+            info.appendChild(metaEl);
+            info.addEventListener('click', () => selectNode(category, node.id));
+            item.appendChild(info);
+
+            const actions = document.createElement('div');
+            actions.className = 'node-actions-container';
+            if (isSelected) {
+                const pin = document.createElement('span');
+                pin.textContent = '📌';
+                actions.appendChild(pin);
+            }
+
+            const nodeMenuWrap = document.createElement('div');
+            nodeMenuWrap.className = 'node-menu-container';
+            nodeMenuWrap.style.cssText = "display: flex; align-items: center; justify-content: flex-end; gap: 8px; position: relative;";
+
+            const pingSpan = document.createElement('span');
+            pingSpan.id = `ping-${category}-${node.id}`;
+            pingSpan.className = 'ping-info';
+            pingSpan.style.cssText = "text-align: right; white-space: nowrap;";
+            if (!isGroup) nodeMenuWrap.appendChild(pingSpan);
+
+            const nodeKebab = _mkButton("⋮", 'btn-menu-trigger', function (e) { toggleNodeMenu(e, this); });
+            nodeKebab.style.flexShrink = '0';
+            nodeMenuWrap.appendChild(nodeKebab);
+
+            const nodeDropdown = document.createElement('div');
+            nodeDropdown.className = 'node-dropdown-menu';
+            // Chain nodes open the chain modal; regular nodes open edit-node-modal
+            nodeDropdown.appendChild(_mkButton(t('menu_edit'), '', (e) => {
+                if (isGroup) { e.stopPropagation(); closeAllMenus(); openPolicyGroupModal(node.id); return; }
+                return isChain ? openProxyChainEditModal(e, category, node.id)
+                               : openEditNodeModal(e, category, node.id);
+            }));
+            nodeDropdown.appendChild(_mkButton(t('menu_move_node'), '',
+                (e) => openMoveNodeModal(e, category, node.id)));
+            if (isGroup) {
+                nodeDropdown.appendChild(_mkButton(t('menu_delete'), 'btn-delete-item',
+                    (e) => deleteNode(e, category, node.id)));
+                nodeMenuWrap.appendChild(nodeDropdown);
+                actions.appendChild(nodeMenuWrap);
+                item.appendChild(actions);
+                listNode.appendChild(item);
+                return;
+            }
+            nodeDropdown.appendChild(_mkButton(t('menu_copy_payload'), '',
+                (e) => copyNodePayloadUrl(e, category, node.id)));
+            nodeDropdown.appendChild(_mkButton(t('menu_copy_full_config'), '',
+                (e) => copyNodeFullConfig(e, category, node.id)));
+            nodeDropdown.appendChild(_mkButton(t('menu_check_http'), 'btn-ping-category',
+                (e) => checkSingleHttpWithClose(e, category, node.id)));
+            nodeDropdown.appendChild(_mkButton(t('menu_check_ip'), 'btn-ping-category',
+                (e) => checkSingleIpWithClose(e, category, node.id)));
+            nodeDropdown.appendChild(_mkButton(t('menu_delete'), 'btn-delete-item',
+                (e) => deleteNode(e, category, node.id)));
+            nodeMenuWrap.appendChild(nodeDropdown);
+
+            actions.appendChild(nodeMenuWrap);
+            item.appendChild(actions);
+            listNode.appendChild(item);
+        });
+        container.appendChild(group);
+    }
+}
+
+function toggleCategoryExpand(event, category) {
+    event.stopPropagation();
+    categoryExpandedState[category] = !categoryExpandedState[category];
+    renderProfiles();
+}
+
+function toggleCategoryMenu(event, button) {
+    event.stopPropagation();
+    const currentMenu = button.nextElementSibling;
+    const isOpen = currentMenu.classList.contains('show');
+    closeAllMenus();
+    if (!isOpen) {
+        currentMenu.classList.add('show');
+    }
+}
+
+function toggleNodeMenu(event, button) {
+    event.stopPropagation();
+    const currentMenu = button.nextElementSibling;
+    const isOpen = currentMenu.classList.contains('show');
+    closeAllMenus();
+    if (!isOpen) {
+        currentMenu.classList.add('show');
+    }
+}
+
+function deleteNode(event, category, id) {
+    event.stopPropagation();
+    closeAllMenus();
+    if (!profiles[category]) return;
+    profiles[category].nodes = profiles[category].nodes.filter(n => n.id !== id);
+    _refreshIfPolicyGroupsUsed();
+    if (activeConfig === `${category}:${id}`) {
+        activeConfig = null;
+        saveActiveConfig();
+    }
+    saveProfiles();
+    renderProfiles();
+}
+
+function copyNodePayloadUrl(event, category, id) {
+    event.stopPropagation();
+    closeAllMenus();
+    const node = profiles[category]?.nodes?.find(n => n.id === id);
+    if (!node) return;
+    navigator.clipboard.writeText(node.rawUri || '').then(() => {
+        showToast(t('toast_node_payload_copied'), 'success');
+    }).catch(() => {
+        showToast(t('toast_node_payload_copy_fail'), 'error');
+    });
+}
+
+function copyNodeFullConfig(event, category, id) {
+    event.stopPropagation();
+    closeAllMenus();
+    const node = profiles[category]?.nodes?.find(n => n.id === id);
+    if (!node) return;
+
+    let configStr;
+    try {
+        configStr = _resolveXrayConfig(node.rawUri);
+    } catch (e) {
+        showToast(t('toast_node_config_gen_fail'), 'error');
+        return;
+    }
+
+    try {
+        const parsed = JSON.parse(configStr);
+        if (parsed && parsed.error) {
+            showToast(t('toast_node_config_gen_fail'), 'error');
+            return;
+        }
+    } catch (e) { /* not JSON-parseable — fall through and copy as-is */ }
+
+    navigator.clipboard.writeText(configStr).then(() => {
+        showToast(t('toast_node_config_copied'), 'success');
+    }).catch(() => {
+        showToast(t('toast_node_config_copy_fail'), 'error');
+    });
+}
+
+// FinalMask lives at streamSettings.finalmask — a network-agnostic block, so it
+// is carried in links as a single JSON blob: the `finalmask` query param for
+// vless/trojan/ss/hysteria2, and the `finalmask` key inside the vmess JSON.
+// Same round-trip convention already used for XHTTP `extra`.
+function _normalizeFinalMask(v) {
+    if (!v) return "";
+    try {
+        return JSON.stringify(typeof v === 'string' ? JSON.parse(v) : v);
+    } catch (e) {
+        // Keep whatever the user/subscription gave us so it survives a round
+        // trip instead of being silently dropped; save-time validation warns.
+        return typeof v === 'string' ? v : "";
+    }
+}
+
+function getFullNodeDetails(node) {
+    const uri = node.rawUri.trim();
+    const protocol = node.protocol;
+    let d = {
+        name: node.name || "Unnamed Node",
+        address: node.address || "",
+        port: node.port || "443",
+        uuid: node.uuid || "",
+        encryption: "none",
+        // VLESS Encryption (post-quantum, outbound `encryption` field on the
+        // vless user object). Distinct from `encryption` above, which is
+        // VMess's legacy cipher (scy) — the two protocols never coexist on a
+        // single node so no naming collision in practice.
+        vlessEncryption: "none",
+        flow: "",
+        network: "tcp",
+        // TCP HTTP header
+        tcpHeaderType: "none",
+        tcpHttpHost: "",
+        tcpHttpPath: "/",
+        // KCP
+        kcpHeader: "none",
+        kcpHost: "",
+        kcpSeed: "",
+        // WS
+        wsPath: "/",
+        wsHost: "",
+        // HTTPUpgrade
+        httpupgradeHost: "",
+        httpupgradePath: "/",
+        // XHTTP
+        xhttpMode: "auto",
+        xhttpHost: "",
+        xhttpPath: "/",
+        xhttpExtra: "",
+        // FinalMask (streamSettings.finalmask, network-agnostic)
+        finalMask: "",
+        // H2
+        h2Host: "",
+        h2Path: "/",
+        // gRPC
+        grpcMode: "gun",
+        grpcAuth: "",
+        grpcServiceName: "",
+        // Security
+        security: "none",
+        sni: "",
+        fingerprint: "chrome",
+        alpn: "",
+        publicKey: "",
+        shortId: "",
+        spiderX: "",
+        pqv: "",
+        allowInsecure: false,
+        pcs: "",
+        ech: "",
+        vcn: "",
+        alterId: "0",
+        headerType: "none",
+        // WireGuard
+        wgSecretKey: "",
+        wgPublicKey: "",
+        wgPresharedKey: "",
+        wgReserved: "",
+        wgLocalAddress: "172.16.0.2/32",
+        // Hysteria2
+        hy2ObfsPassword: "",
+        hy2PortHopping: "",
+        hy2HopInterval: "",
+        hy2BandwidthDown: "",
+        hy2BandwidthUp: "",
+        hy2Sni: "",
+        // MASQUE
+        masqueHost: "",
+        masquePath: "",
+        masqueHeaders: "",
+        masqueDns: "",
+        masqueWarpPrivateKey: "",
+        masqueWarpPublicKey: "",
+        masqueAddress: "",
+        // SOCKS / HTTP proxy auth
+        proxyUsername: "",
+        proxyPassword: "",
+        // Shadowsocks method
+        ssMethod: "aes-256-gcm"
+    };
+
+    if (protocol === 'vmess') {
+        try {
+            const base64Part = uri.includes("://") ? uri.split("://")[1] : uri;
+            const rawJson = decodeBase64(base64Part.trim());
+            const c = JSON.parse(rawJson);
+            d.address = c.add || "";
+            d.port = c.port || "443";
+            d.uuid = c.id || "";
+            d.encryption = c.scy || "none";
+            d.network = c.net || "tcp";
+            d.security = c.tls || "none";
+            d.sni = c.sni || "";
+            d.alpn = c.alpn || "";
+            d.allowInsecure = c.allowInsecure === true || c.allowInsecure === "1" || c.allowInsecure === 1;
+            d.pcs = c.pcs || "";
+            d.ech = c.ech || "";
+            d.vcn = c.vcn || "";
+            d.alterId = c.aid !== undefined ? String(c.aid) : "0";
+            d.headerType = c.type || "none";
+            // Per-network fields
+            d.finalMask = _normalizeFinalMask(c.finalmask);
+
+            if (c.net === 'tcp') {
+                d.tcpHeaderType = c.type || "none";
+                if (c.type === 'http') {
+                    d.tcpHttpHost = c.host || "";
+                    d.tcpHttpPath = c.path || "/";
+                }
+            } else if (c.net === 'kcp' || c.net === 'mkcp') {
+                d.kcpHeader = c.type || "none";
+                d.kcpHost = c.host || "";
+                d.kcpSeed = c.seed || "";
+            } else if (c.net === 'ws') {
+                d.wsPath = c.path || "/";
+                d.wsHost = c.host || "";
+            } else if (c.net === 'httpupgrade') {
+                d.httpupgradeHost = c.host || "";
+                d.httpupgradePath = c.path || "/";
+            } else if (c.net === 'xhttp' || c.net === 'splithttp') {
+                d.xhttpMode = c.mode || "auto";
+                d.xhttpHost = c.host || "";
+                d.xhttpPath = c.path || "/";
+                d.xhttpExtra = c.extra ? JSON.stringify(c.extra) : "";
+            } else if (c.net === 'h2' || c.net === 'http') {
+                d.h2Host = c.host || "";
+                d.h2Path = c.path || "/";
+            } else if (c.net === 'grpc') {
+                d.grpcServiceName = c.path || "";
+                d.grpcMode = c.mode || "gun";
+                d.grpcAuth = c.authority || "";
+            }
+        } catch (e) { console.error("Error parsing vmess json", e); }
+    } else {
+        try {
+            // Fix parser on old Chrome
+            // NOTE: ss/shadowsocks must be included here too — on older
+            // WebView engines, `new URL()` only extracts authority
+            // (hostname/port/username) for "special" schemes (http, https,
+            // ws, wss, ftp, file). A non-special scheme like "ss:" silently
+            // yields an EMPTY hostname/port instead of throwing, so without
+            // this swap the block below unconditionally overwrote a
+            // correctly-parsed d.address/d.port (from parseProxyUri) with
+            // blank values when the edit modal was opened.
+            const fakeHttpUri = normalizeUriIPv6Host(uri).replace(/^(vless|trojan|wg|wireguard|hy2|hysteria2|masque|socks5|socks|ss|shadowsocks):\/\//i, 'https://');
+            const u = new URL(fakeHttpUri);
+            const p = new URLSearchParams(u.search);
+            d.uuid = decodeURIComponent(u.username);
+            // Shadowsocks keeps the address/port already parsed by
+            // parseProxyUri (node.address/node.port, set as d's defaults
+            // above) instead of trusting `u.hostname`/`u.port` here: the
+            // legacy fully-base64-encoded ss:// form (no literal "@") has
+            // no real authority for the URL parser to find, so this would
+            // otherwise overwrite a correct address with garbage.
+            if (protocol !== 'shadowsocks' && protocol !== 'ss') {
+                d.address = unwrapIPv6(u.hostname);
+                d.port = u.port || "443";
+            }
+            d.network = p.get('type') || 'tcp';
+            d.security = p.get('security') || 'none';
+            d.flow = p.get('flow') || '';
+            d.sni = p.get('sni') || '';
+            d.alpn = p.get('alpn') || '';
+            d.fingerprint = p.get('fp') || 'chrome';
+            d.allowInsecure = p.get('insecure') === '1' || p.get('allowInsecure') === '1' || p.get('allowInsecure') === 'true';
+            d.pcs = p.get('pcs') || '';
+            d.ech = p.get('ech') || '';
+            d.vcn = p.get('vcn') || '';
+            d.finalMask = _normalizeFinalMask(p.get('finalmask'));
+            d.vlessEncryption = p.get('encryption') || 'none';
+
+            // Per-network fields
+            if (d.network === 'tcp') {
+                d.tcpHeaderType = p.get('headerType') || 'none';
+                if (d.tcpHeaderType === 'http') {
+                    d.tcpHttpHost = p.get('host') || '';
+                    d.tcpHttpPath = p.get('path') || '/';
+                }
+            } else if (d.network === 'kcp' || d.network === 'mkcp') {
+                d.kcpHeader = p.get('headerType') || 'none';
+                d.kcpHost = p.get('host') || '';
+                d.kcpSeed = p.get('seed') || '';
+            } else if (d.network === 'ws') {
+                d.wsPath = p.get('path') || '/';
+                d.wsHost = p.get('host') || '';
+            } else if (d.network === 'httpupgrade') {
+                d.httpupgradeHost = p.get('host') || '';
+                d.httpupgradePath = p.get('path') || '/';
+            } else if (d.network === 'xhttp' || d.network === 'splithttp') {
+                d.xhttpMode = p.get('mode') || 'auto';
+                d.xhttpHost = p.get('host') || '';
+                d.xhttpPath = p.get('path') || '/';
+                try { d.xhttpExtra = p.get('extra') ? JSON.stringify(JSON.parse(p.get('extra'))) : ''; } catch(e) { d.xhttpExtra = p.get('extra') || ''; }
+            } else if (d.network === 'h2' || d.network === 'http') {
+                d.h2Host = p.get('host') || '';
+                d.h2Path = p.get('path') || '/';
+            } else if (d.network === 'grpc') {
+                d.grpcServiceName = p.get('serviceName') || p.get('path') || '';
+                d.grpcMode = p.get('mode') || 'gun';
+                d.grpcAuth = p.get('authority') || '';
+            }
+
+            if (d.security === 'reality') {
+                d.publicKey = p.get('pbk') || '';
+                d.shortId = p.get('sid') || '';
+                d.spiderX = p.get('spx') || '';
+                d.pqv = p.get('pqv') || '';
+            }
+        } catch (e) { console.error("Error parsing standard URL mapping", e); }
+    }
+
+    // Shadowsocks
+    if (protocol === 'shadowsocks') {
+        // Parse method directly from the URI (base64 or plain-text userinfo)
+        try {
+            const atIdx = uri.indexOf('@');
+            if (atIdx !== -1) {
+                const schemeEnd = uri.indexOf('://') + 3;
+                const rawUser = uri.substring(schemeEnd, atIdx);
+                let method = null;
+                // Try base64 decode first
+                try {
+                    const decoded = decodeBase64(rawUser);
+                    if (decoded && decoded.includes(':')) {
+                        method = decoded.substring(0, decoded.indexOf(':'));
+                    }
+                } catch(e) {}
+                // Fallback: plain-text URL-encoded
+                if (!method) {
+                    const plain = decodeURIComponent(rawUser);
+                    if (plain.includes(':')) method = plain.substring(0, plain.indexOf(':'));
+                }
+                if (method) d.ssMethod = method;
+            }
+        } catch(e) {}
+        // Final fallback to stored node.security
+        if (!d.ssMethod) d.ssMethod = node.security || "aes-256-gcm";
+        d.uuid = node.uuid || ""; // password
+
+        // Transport/security: either the extended type=/security= query params
+        // (this project's own format, same shape as vless/trojan), or a legacy
+        // SIP003 plugin= param translated into the equivalent network/security
+        // fields so it renders correctly in the standard Transport/Security UI.
+        try {
+            const qIdx = uri.indexOf('?');
+            if (qIdx !== -1) {
+                const hashIdx = uri.indexOf('#');
+                const qEnd = (hashIdx !== -1 && hashIdx > qIdx) ? hashIdx : uri.length;
+                const p = new URLSearchParams(uri.substring(qIdx + 1, qEnd));
+
+                if (p.get('type')) {
+                    d.network = p.get('type') || 'tcp';
+                    d.security = p.get('security') || 'none';
+                    d.sni = p.get('sni') || '';
+                    d.alpn = p.get('alpn') || '';
+                    d.fingerprint = p.get('fp') || 'chrome';
+                    d.allowInsecure = p.get('insecure') === '1' || p.get('allowInsecure') === '1' || p.get('allowInsecure') === 'true';
+                    d.pcs = p.get('pcs') || '';
+                    d.ech = p.get('ech') || '';
+            d.vcn = p.get('vcn') || '';
+                    d.finalMask = _normalizeFinalMask(p.get('finalmask'));
+
+                    if (d.network === 'tcp') {
+                        d.tcpHeaderType = p.get('headerType') || 'none';
+                        if (d.tcpHeaderType === 'http') {
+                            d.tcpHttpHost = p.get('host') || '';
+                            d.tcpHttpPath = p.get('path') || '/';
+                        }
+                    } else if (d.network === 'kcp' || d.network === 'mkcp') {
+                        d.kcpHeader = p.get('headerType') || 'none';
+                        d.kcpHost = p.get('host') || '';
+                        d.kcpSeed = p.get('seed') || '';
+                    } else if (d.network === 'ws') {
+                        d.wsPath = p.get('path') || '/';
+                        d.wsHost = p.get('host') || '';
+                    } else if (d.network === 'httpupgrade') {
+                        d.httpupgradeHost = p.get('host') || '';
+                        d.httpupgradePath = p.get('path') || '/';
+                    } else if (d.network === 'xhttp' || d.network === 'splithttp') {
+                        d.xhttpMode = p.get('mode') || 'auto';
+                        d.xhttpHost = p.get('host') || '';
+                        d.xhttpPath = p.get('path') || '/';
+                        try { d.xhttpExtra = p.get('extra') ? JSON.stringify(JSON.parse(p.get('extra'))) : ''; } catch(e) { d.xhttpExtra = p.get('extra') || ''; }
+                    } else if (d.network === 'h2' || d.network === 'http') {
+                        d.h2Host = p.get('host') || '';
+                        d.h2Path = p.get('path') || '/';
+                    } else if (d.network === 'grpc') {
+                        d.grpcServiceName = p.get('serviceName') || p.get('path') || '';
+                        d.grpcMode = p.get('mode') || 'gun';
+                        d.grpcAuth = p.get('authority') || '';
+                    }
+
+                    if (d.security === 'reality') {
+                        d.publicKey = p.get('pbk') || '';
+                        d.shortId = p.get('sid') || '';
+                        d.spiderX = p.get('spx') || '';
+                        d.pqv = p.get('pqv') || '';
+                    }
+                } else {
+                    const pluginStr = p.get('plugin');
+                    if (pluginStr) {
+                        const parts = pluginStr.split(';');
+                        if (parts[0] === 'v2ray-plugin') {
+                            const opts = {};
+                            for (let i = 1; i < parts.length; i++) {
+                                const seg = parts[i];
+                                if (!seg) continue;
+                                const eq = seg.indexOf('=');
+                                if (eq === -1) opts[seg] = true;
+                                else opts[seg.substring(0, eq)] = seg.substring(eq + 1);
+                            }
+                            // quic legacy mode isn't editable in the UI; still land
+                            // on ws so the node opens with sane defaults.
+                            d.network = 'ws';
+                            d.security = opts.tls ? 'tls' : 'none';
+                            d.wsHost = opts.host || '';
+                            d.wsPath = opts.path || '/';
+                            if (opts.tls) d.sni = opts.host || '';
+                        }
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+
+    // WireGuard
+    if (protocol === 'wireguard') {
+        try {
+            const u = new URL(normalizeUriIPv6Host(uri).replace(/^(wg|wireguard):\/\//i, 'https://'));
+            const p = new URLSearchParams(u.search);
+            d.wgSecretKey = u.username ? decodeURIComponent(u.username) : "";
+            d.wgPublicKey = p.get('publickey') || p.get('PublicKey') || "";
+            d.wgPresharedKey = p.get('presharedkey') || p.get('PreSharedKey') || "";
+            d.wgReserved = p.get('reserved') || "";
+            d.wgLocalAddress = p.get('address') || p.get('ip') || "172.16.0.2/32";
+            d.wgMTU = p.get('mtu') || 1420;
+        } catch(e) {}
+    }
+
+    // Hysteria2
+    if (protocol === 'hysteria2') {
+        try {
+            const fixedUri = normalizeUriIPv6Host(uri).replace(/^(hy2|hysteria2):\/\//i, 'https://');
+            const u = new URL(fixedUri);
+            const p = new URLSearchParams(u.search);
+            d.uuid = decodeURIComponent(u.username);
+            const obfs = p.get('obfs-password') || p.get('obfsPassword') || "";
+            d.hy2ObfsPassword = obfs;
+            d.hy2Sni = p.get('sni') || p.get('peer') || "";
+            d.hy2BandwidthDown = p.get('down') || p.get('bandwidth') || "";
+            d.hy2BandwidthUp = p.get('up') || "";
+            d.hy2PortHopping = p.get('mport') || "";
+            d.hy2HopInterval = p.get('hopInterval') || "";
+            d.ech = p.get('ech') || "";
+            d.finalMask = _normalizeFinalMask(p.get('finalmask'));
+        } catch(e) {}
+    }
+
+    // MASQUE
+    if (protocol === 'masque') {
+        try {
+            const u = new URL(normalizeUriIPv6Host(uri).replace(/^masque:\/\//i, 'https://'));
+            const p = new URLSearchParams(u.search);
+            d.uuid = "";
+            d.security = 'tls';
+            d.proxyUsername = u.username ? decodeURIComponent(u.username) : "";
+            d.proxyPassword = u.password ? decodeURIComponent(u.password) : "";
+            d.masqueHost = p.get('host') || "";
+            d.masquePath = p.get('path') || "";
+            d.masqueHeaders = p.get('headers') || "";
+            d.masqueDns = p.get('dns') || "";
+            d.masqueWarpPrivateKey = p.get('wpk') || "";
+            d.masqueWarpPublicKey = p.get('wpub') || "";
+            d.masqueAddress = p.get('address') || "";
+            d.sni = p.get('sni') || "";
+            d.alpn = p.get('alpn') || "";
+            d.fingerprint = p.get('fp') || "chrome";
+            d.pcs = p.get('pcs') || "";
+            d.vcn = p.get('vcn') || "";
+            d.ech = "";
+            d.finalMask = _normalizeFinalMask(p.get('finalmask'));
+        } catch(e) {}
+    }
+
+    // SOCKS
+    if (protocol === 'socks') {
+        try {
+            const u = new URL(normalizeUriIPv6Host(uri));
+            d.proxyUsername = u.username ? decodeURIComponent(u.username) : "";
+            d.proxyPassword = u.password ? decodeURIComponent(u.password) : "";
+        } catch(e) {}
+    }
+
+    // HTTP proxy
+    if (protocol === 'http') {
+        try {
+            const u = new URL(normalizeUriIPv6Host(uri));
+            d.proxyUsername = u.username ? decodeURIComponent(u.username) : "";
+            d.proxyPassword = u.password ? decodeURIComponent(u.password) : "";
+        } catch(e) {}
+    }
+
+    return d;
+}
+
+function serializeNodeDetailsToUri(d, protocol) {
+    // Shadowsocks
+    if (protocol === 'shadowsocks') {
+        const method = d.ssMethod || "aes-256-gcm";
+        const password = d.uuid || "";
+        const userPart = btoa(`${method}:${password}`);
+        let urlStr = `ss://${userPart}@${bracketIPv6(d.address)}:${d.port}`;
+
+        // Same transport/security query params as vless/trojan — covers
+        // tcp/kcp/ws/httpupgrade/xhttp/h2/grpc plus tls/reality.
+        let params = new URLSearchParams();
+        params.set('type', d.network || 'tcp');
+        params.set('security', d.security || 'none');
+        if (d.security === 'tls' || d.security === 'reality') {
+            if (d.sni) params.set('sni', d.sni);
+            if (d.alpn) params.set('alpn', d.alpn);
+            if (d.fingerprint) params.set('fp', d.fingerprint);
+        }
+        if (d.security === 'tls') {
+            // "allowInsecure" was removed by Xray-core; never emit it into the exported URI.
+            if (d.pcs) params.set('pcs', d.pcs);
+            if (d.ech) params.set('ech', d.ech);
+            if (d.vcn) params.set('vcn', d.vcn);
+        }
+        if (d.network === 'tcp' && d.tcpHeaderType && d.tcpHeaderType !== 'none') {
+            params.set('headerType', d.tcpHeaderType);
+            if (d.tcpHeaderType === 'http') {
+                if (d.tcpHttpHost) params.set('host', d.tcpHttpHost);
+                if (d.tcpHttpPath) params.set('path', d.tcpHttpPath);
+            }
+        } else if (d.network === 'kcp' || d.network === 'mkcp') {
+            if (d.kcpHeader && d.kcpHeader !== 'none') params.set('headerType', d.kcpHeader);
+            if (d.kcpHost) params.set('host', d.kcpHost);
+            if (d.kcpSeed) params.set('seed', d.kcpSeed);
+        } else if (d.network === 'ws') {
+            if (d.wsPath) params.set('path', d.wsPath);
+            if (d.wsHost) params.set('host', d.wsHost);
+        } else if (d.network === 'httpupgrade') {
+            if (d.httpupgradeHost) params.set('host', d.httpupgradeHost);
+            if (d.httpupgradePath) params.set('path', d.httpupgradePath);
+        } else if (d.network === 'xhttp' || d.network === 'splithttp') {
+            if (d.xhttpMode && d.xhttpMode !== 'auto') params.set('mode', d.xhttpMode);
+            if (d.xhttpHost) params.set('host', d.xhttpHost);
+            if (d.xhttpPath) params.set('path', d.xhttpPath);
+            if (d.xhttpExtra) { try { params.set('extra', d.xhttpExtra); } catch(e) {} }
+        } else if (d.network === 'h2' || d.network === 'http') {
+            if (d.h2Host) params.set('host', d.h2Host);
+            if (d.h2Path) params.set('path', d.h2Path);
+        } else if (d.network === 'grpc') {
+            if (d.grpcServiceName) params.set('serviceName', d.grpcServiceName);
+            if (d.grpcMode && d.grpcMode !== 'gun') params.set('mode', d.grpcMode);
+            if (d.grpcAuth) params.set('authority', d.grpcAuth);
+        }
+        if (d.security === 'reality') {
+            if (d.publicKey) params.set('pbk', d.publicKey);
+            if (d.shortId) params.set('sid', d.shortId);
+            if (d.spiderX) params.set('spx', d.spiderX);
+            if (d.pqv) params.set('pqv', d.pqv);
+        }
+        if (d.finalMask) params.set('finalmask', d.finalMask);
+        let pStr = params.toString();
+        if (pStr) urlStr += "?" + pStr;
+
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+
+    // WireGuard
+    if (protocol === 'wireguard') {
+        const params = new URLSearchParams();
+        if (d.wgPublicKey) params.set('publickey', d.wgPublicKey);
+        if (d.wgPresharedKey) params.set('presharedkey', d.wgPresharedKey);
+        if (d.wgReserved) params.set('reserved', d.wgReserved);
+        if (d.wgLocalAddress) params.set('address', d.wgLocalAddress);
+        if (d.wgMTU) params.set('mtu', d.wgMTU);
+        const user = d.wgSecretKey ? encodeURIComponent(d.wgSecretKey) : "";
+        let urlStr = `wireguard://${user}@${bracketIPv6(d.address)}:${d.port}`;
+        const pStr = params.toString();
+        if (pStr) urlStr += "?" + pStr;
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+
+    // Hysteria2
+    if (protocol === 'hysteria2') {
+        const params = new URLSearchParams();
+        if (d.hy2ObfsPassword) { params.set('obfs', 'salamander'); params.set('obfs-password', d.hy2ObfsPassword); }
+        if (d.hy2Sni) params.set('sni', d.hy2Sni);
+        if (d.hy2BandwidthDown) params.set('down', d.hy2BandwidthDown);
+        if (d.hy2BandwidthUp) params.set('up', d.hy2BandwidthUp);
+        if (d.hy2PortHopping) params.set('mport', d.hy2PortHopping);
+        if (d.hy2HopInterval) params.set('hopInterval', d.hy2HopInterval);
+        if (d.ech) params.set('ech', d.ech);
+        if (d.finalMask) params.set('finalmask', d.finalMask);
+        const user = d.uuid ? encodeURIComponent(d.uuid) : "";
+        let urlStr = `hysteria2://${user}@${bracketIPv6(d.address)}:${d.port}`;
+        const pStr = params.toString();
+        if (pStr) urlStr += "?" + pStr;
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+
+    // MASQUE
+    if (protocol === 'masque') {
+        const params = new URLSearchParams();
+        if (d.masqueHost) params.set('host', d.masqueHost);
+        if (d.masquePath) params.set('path', d.masquePath);
+        if (d.masqueHeaders) params.set('headers', d.masqueHeaders);
+        if (d.masqueDns) params.set('dns', d.masqueDns);
+        if (d.masqueWarpPrivateKey) {
+            params.set('wpk', d.masqueWarpPrivateKey);
+            if (d.masqueWarpPublicKey) params.set('wpub', d.masqueWarpPublicKey);
+            if (d.masqueAddress) params.set('address', d.masqueAddress);
+        }
+        if (d.sni) params.set('sni', d.sni);
+        if (d.alpn) params.set('alpn', d.alpn);
+        if (d.fingerprint && d.fingerprint !== 'chrome') params.set('fp', d.fingerprint);
+        if (d.pcs) params.set('pcs', d.pcs);
+        if (d.vcn) params.set('vcn', d.vcn);
+        if (d.finalMask) params.set('finalmask', d.finalMask);
+        // user/pass cannot be combined with a WARP device.
+        let auth = "";
+        if (!d.masqueWarpPrivateKey && (d.proxyUsername || d.proxyPassword)) {
+            auth = encodeURIComponent(d.proxyUsername || "");
+            if (d.proxyPassword) auth += ":" + encodeURIComponent(d.proxyPassword);
+            auth += "@";
+        }
+        let urlStr = `masque://${auth}${bracketIPv6(d.address)}:${d.port}`;
+        const pStr = params.toString();
+        if (pStr) urlStr += "?" + pStr;
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+
+    // SOCKS
+    if (protocol === 'socks') {
+        let auth = "";
+        if (d.proxyUsername) {
+            auth = encodeURIComponent(d.proxyUsername);
+            if (d.proxyPassword) auth += ":" + encodeURIComponent(d.proxyPassword);
+            auth += "@";
+        }
+        let urlStr = `socks://${auth}${bracketIPv6(d.address)}:${d.port}`;
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+
+    // HTTP proxy
+    if (protocol === 'http') {
+        let auth = "";
+        if (d.proxyUsername) {
+            auth = encodeURIComponent(d.proxyUsername);
+            if (d.proxyPassword) auth += ":" + encodeURIComponent(d.proxyPassword);
+            auth += "@";
+        }
+        let urlStr = `http://${auth}${bracketIPv6(d.address)}:${d.port}`;
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+
+    if (protocol === 'vmess') {
+        let c = {
+            v: "2", ps: d.name, add: d.address, port: parseInt(d.port) || 443, id: d.uuid,
+            aid: parseInt(d.alterId) || 0, scy: d.encryption || "none", net: d.network,
+            tls: d.security === 'tls' ? 'tls' : 'none',
+            sni: d.security === 'tls' ? d.sni : "",
+            alpn: d.security === 'tls' ? d.alpn : "",
+            type: "none", host: "", path: ""
+        };
+        if (d.security === 'tls') {
+            // "allowInsecure" was removed by Xray-core; never emit it into the exported vmess link.
+            if (d.pcs) c.pcs = d.pcs;
+            if (d.ech) c.ech = d.ech;
+            if (d.vcn) c.vcn = d.vcn;
+        }
+        if (d.network === 'tcp') {
+            c.type = d.tcpHeaderType || "none";
+            if (d.tcpHeaderType === 'http') { c.host = d.tcpHttpHost; c.path = d.tcpHttpPath; }
+        } else if (d.network === 'kcp' || d.network === 'mkcp') {
+            c.type = d.kcpHeader || "none";
+            c.host = d.kcpHost || "";
+            c.seed = d.kcpSeed || "";
+        } else if (d.network === 'ws') {
+            c.path = d.wsPath || "/"; c.host = d.wsHost || "";
+        } else if (d.network === 'httpupgrade') {
+            c.host = d.httpupgradeHost || ""; c.path = d.httpupgradePath || "/";
+        } else if (d.network === 'xhttp' || d.network === 'splithttp') {
+            c.mode = d.xhttpMode || "auto";
+            c.host = d.xhttpHost || ""; c.path = d.xhttpPath || "/";
+            if (d.xhttpExtra) { try { c.extra = JSON.parse(d.xhttpExtra); } catch(e) {} }
+        } else if (d.network === 'h2' || d.network === 'http') {
+            c.host = d.h2Host || ""; c.path = d.h2Path || "/";
+        } else if (d.network === 'grpc') {
+            c.path = d.grpcServiceName || "";
+            c.mode = d.grpcMode || "gun";
+            c.authority = d.grpcAuth || "";
+        }
+        if (d.finalMask) { try { c.finalmask = JSON.parse(d.finalMask); } catch(e) {} }
+        return "vmess://" + utoa(JSON.stringify(c));
+    } else {
+        let urlStr = `${protocol}://${encodeURIComponent(d.uuid)}@${bracketIPv6(d.address)}:${d.port}`;
+        let params = new URLSearchParams();
+        if (d.network && d.network !== 'tcp') params.set('type', d.network);
+        if (d.security !== 'none') params.set('security', d.security);
+        if (protocol === 'vless' && d.flow && (d.security === 'tls' || d.security === 'reality')) params.set('flow', d.flow);
+        if (d.security === 'tls' || d.security === 'reality') {
+            if (d.sni) params.set('sni', d.sni);
+            if (d.alpn) params.set('alpn', d.alpn);
+            if (d.fingerprint) params.set('fp', d.fingerprint);
+        }
+        if (d.security === 'tls') {
+            // "allowInsecure" was removed by Xray-core; never emit it into the exported URI.
+            if (d.pcs) params.set('pcs', d.pcs);
+            if (d.ech) params.set('ech', d.ech);
+            if (d.vcn) params.set('vcn', d.vcn);
+        }
+        // Per-network params
+        if (d.network === 'tcp' && d.tcpHeaderType && d.tcpHeaderType !== 'none') {
+            params.set('headerType', d.tcpHeaderType);
+            if (d.tcpHeaderType === 'http') {
+                if (d.tcpHttpHost) params.set('host', d.tcpHttpHost);
+                if (d.tcpHttpPath) params.set('path', d.tcpHttpPath);
+            }
+        } else if (d.network === 'kcp' || d.network === 'mkcp') {
+            if (d.kcpHeader && d.kcpHeader !== 'none') params.set('headerType', d.kcpHeader);
+            if (d.kcpHost) params.set('host', d.kcpHost);
+            if (d.kcpSeed) params.set('seed', d.kcpSeed);
+        } else if (d.network === 'ws') {
+            if (d.wsPath) params.set('path', d.wsPath);
+            if (d.wsHost) params.set('host', d.wsHost);
+        } else if (d.network === 'httpupgrade') {
+            if (d.httpupgradeHost) params.set('host', d.httpupgradeHost);
+            if (d.httpupgradePath) params.set('path', d.httpupgradePath);
+        } else if (d.network === 'xhttp' || d.network === 'splithttp') {
+            if (d.xhttpMode && d.xhttpMode !== 'auto') params.set('mode', d.xhttpMode);
+            if (d.xhttpHost) params.set('host', d.xhttpHost);
+            if (d.xhttpPath) params.set('path', d.xhttpPath);
+            if (d.xhttpExtra) { try { params.set('extra', d.xhttpExtra); } catch(e) {} }
+        } else if (d.network === 'h2' || d.network === 'http') {
+            if (d.h2Host) params.set('host', d.h2Host);
+            if (d.h2Path) params.set('path', d.h2Path);
+        } else if (d.network === 'grpc') {
+            if (d.grpcServiceName) params.set('serviceName', d.grpcServiceName);
+            if (d.grpcMode && d.grpcMode !== 'gun') params.set('mode', d.grpcMode);
+            if (d.grpcAuth) params.set('authority', d.grpcAuth);
+        }
+        if (d.security === 'reality') {
+            if (d.publicKey) params.set('pbk', d.publicKey);
+            if (d.shortId) params.set('sid', d.shortId);
+            if (d.spiderX) params.set('spx', d.spiderX);
+            if (d.pqv) params.set('pqv', d.pqv);
+        }
+        if (protocol === 'vless' && d.vlessEncryption && d.vlessEncryption !== 'none') {
+            params.set('encryption', d.vlessEncryption);
+        }
+        if (d.finalMask) params.set('finalmask', d.finalMask);
+        let pStr = params.toString();
+        if (pStr) urlStr += "?" + pStr;
+        if (d.name) urlStr += "#" + encodeURIComponent(d.name);
+        return urlStr;
+    }
+}
+
+function openEditNodeModal(event, category, id) {
+    event.stopPropagation();
+    closeAllMenus();
+
+    const node = profiles[category]?.nodes?.find(n => n.id === id);
+    if (!node) return;
+
+    currentEditingCategory = category;
+    currentEditingNodeId = id;
+    currentEditingProtocol = node.protocol;
+    _populateEditModal(node);
+    _populateEditCategory(category);
+}
+
+// Category selector at the bottom of the node modal. New nodes default to
+// Manual; editing preselects the node's current category.
+function _populateEditCategory(selected) {
+    const sel = document.getElementById('edit-node-category');
+    if (!sel) return;
+    sel.innerHTML = '';
+    const cats = Object.keys(profiles);
+    if (!cats.includes(selected)) cats.unshift(selected);
+    cats.forEach(c => {
+        const o = document.createElement('option');
+        o.value = c;
+        o.textContent = c;
+        sel.appendChild(o);
+    });
+    sel.value = selected;
+}
+
+function openNewNodeModal(protocol) {
+    // Create a temporary empty node so we can reuse the same modal
+    const tempId = '__new__' + Math.random().toString(36).substr(2, 9);
+    // Ensure Manual category exists
+    if (!profiles['Manual']) profiles['Manual'] = { url: null, nodes: [] };
+    const emptyNode = {
+        id: tempId,
+        name: "",
+        protocol,
+        address: "",
+        port: protocol === 'wireguard' ? "51820" : protocol === 'socks' ? "1080" : protocol === 'http' ? "8080" : "443",
+        uuid: "",
+        security: (protocol === 'hysteria2' || protocol === 'masque') ? "tls" : "none",
+        rawUri: `${protocol}://@:`
+    };
+    currentEditingCategory = 'Manual';
+    currentEditingNodeId = tempId;
+    currentEditingProtocol = protocol;
+    _populateEditModal(emptyNode, true);
+    _populateEditCategory('Manual');
+}
+
+// Parses the plain-text output of `xray wg genkey`:
+//   PrivateKey: <base64>
+//   Password (PublicKey): <base64>
+// Done in JS (not sed) so the shell side stays a single, literal, argument-
+// free command. Returns { privateKey, publicKey }, either empty on failure.
+function _parseXrayWgGenkey(out) {
+    let privateKey = '', publicKey = '';
+    for (const line of String(out).split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('PrivateKey:')) {
+            privateKey = trimmed.slice('PrivateKey:'.length).trim();
+        } else if (trimmed.startsWith('Password (PublicKey):')) {
+            publicKey = trimmed.slice('Password (PublicKey):'.length).trim();
+        }
+    }
+    return { privateKey, publicKey };
+}
+
+// Decodes a WARP `client_id` (base64, always 3 bytes) into the comma-separated
+// decimal reserved bytes the WireGuard outbound needs — the same value
+// wgcf-cli used to expose as `reserved_dec`.
+function _warpReservedFromClientId(clientId) {
+    try {
+        const bin = atob(clientId);
+        return Array.from(bin, ch => ch.charCodeAt(0)).join(',');
+    } catch (e) {
+        return '';
+    }
+}
+
+// Registers a fresh, free Cloudflare WARP account straight against
+// Cloudflare's API (no wgcf-cli involved) and fills the currently-open
+// WireGuard editor fields with it (endpoint, private key, server public key,
+// reserved bytes, local address). Nothing is persisted until the user
+// presses Save — running it again just overwrites the form fields with a
+// brand-new account ("Generate new account").
+//
+// Two separate shell round-trips, both plain literal commands (no sed, no
+// shell-side JSON building): (1) run `xray wg genkey` and parse its text
+// output in JS, (2) curl the registration endpoint with the parsed public
+// key — shQuote()'d, since it now round-trips through this file's own
+// string handling before going back to the shell — and parse the JSON
+// response in JS.
+async function generateWarpAccount() {
+    await asyncShowLoading(t('btn_generate_warp_running'));
+    try {
+        const genkeyOut = await execShellAsync(`${MODDIR}/bin/xray wg genkey`);
+        const { privateKey, publicKey } = _parseXrayWgGenkey(genkeyOut);
+        if (!privateKey || !publicKey) {
+            showToast(t('toast_warp_failed'), 'error');
+            return;
+        }
+
+        const body = JSON.stringify({
+            key: publicKey,
+            type: 'Android',
+            model: 'Android',
+            locale: 'en_US'
+        });
+        const jsonText = await execShellAsync(
+            `${MODDIR}/bin/curl -fsSL --max-time 15 -X POST "https://api.cloudflareclient.com/v0a2158/reg" ` +
+            `-H "CF-Client-Version: a-7.21-0721" -H "User-Agent: okhttp/0.7.21" ` +
+            `-H "Content-Type: application/json; charset=UTF-8" -d ${shQuote(body)}`
+        );
+
+        let reg = null;
+        try { reg = JSON.parse(jsonText); } catch (e) { reg = null; }
+        const c = reg && reg.config;
+        const peer = c && c.peers && c.peers[0];
+        if (!c || !peer || !peer.public_key) {
+            showToast(t('toast_warp_failed'), 'error');
+            return;
+        }
+
+        const endpointHost = (peer.endpoint && (peer.endpoint.host || peer.endpoint.v4)) || 'engage.cloudflareclient.com:2408';
+        const hostPart = endpointHost.split(':')[0];
+        const portPart = endpointHost.includes(':') ? endpointHost.split(':').pop() : '2408';
+        const reserved = c.client_id ? _warpReservedFromClientId(c.client_id) : '';
+        const addrs = [];
+        if (c.interface?.addresses?.v4) addrs.push(`${c.interface.addresses.v4}/32`);
+        if (c.interface?.addresses?.v6) addrs.push(`${c.interface.addresses.v6}/128`);
+
+        document.getElementById('edit-address').value = hostPart;
+        document.getElementById('edit-port').value = portPart || '2408';
+        document.getElementById('edit-wg-secret-key').value = privateKey;
+        document.getElementById('edit-wg-public-key').value = peer.public_key;
+        document.getElementById('edit-wg-preshared-key').value = '';
+        document.getElementById('edit-wg-reserved').value = reserved;
+        document.getElementById('edit-wg-local-address').value = addrs.length ? addrs.join(',') : '172.16.0.2/32';
+        document.getElementById('edit-wg-mtu').value = 1280;
+        const nameEl = document.getElementById('edit-remarks');
+        if (nameEl && !nameEl.value.trim()) nameEl.value = 'WARP';
+
+        showToast(t('toast_warp_success'), 'success');
+    } catch (e) {
+        showToast(t('toast_warp_failed'), 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+function _populateEditModal(node, isNew = false) {
+    const d = isNew ? {
+        name: "", address: "", port: node.port || "443", uuid: "", encryption: "auto", vlessEncryption: "none",
+        flow: "", network: "tcp", tcpHeaderType: "none", tcpHttpHost: "", tcpHttpPath: "/",
+        kcpHeader: "none", kcpHost: "", kcpSeed: "", wsPath: "/", wsHost: "",
+        httpupgradeHost: "", httpupgradePath: "/", xhttpMode: "auto", xhttpHost: "",
+        xhttpPath: "/", xhttpExtra: "", finalMask: "", h2Host: "", h2Path: "/", grpcMode: "gun",
+        grpcAuth: "", grpcServiceName: "", security: node.security || "none", sni: "",
+        fingerprint: "chrome", alpn: "", publicKey: "", shortId: "", spiderX: "", pqv: "", alterId: "0",
+        headerType: "none", wgSecretKey: "", wgPublicKey: "", wgPresharedKey: "",
+        wgReserved: "", wgLocalAddress: "172.16.0.2/32", hy2ObfsPassword: "",
+        hy2PortHopping: "", hy2HopInterval: "", hy2BandwidthDown: "", hy2BandwidthUp: "",
+        hy2Sni: "", proxyUsername: "", proxyPassword: "", ssMethod: "aes-256-gcm",
+        masqueHost: "", masquePath: "", masqueHeaders: "", masqueDns: "",
+        masqueWarpPrivateKey: "", masqueWarpPublicKey: "", masqueAddress: ""
+    } : getFullNodeDetails(node);
+
+    const proto = node.protocol;
+
+    document.getElementById('edit-remarks').value = d.name;
+    document.getElementById('edit-address').value = d.address;
+    document.getElementById('edit-port').value = d.port;
+    document.getElementById('edit-uuid').value = d.uuid;
+    const vlessEncEl = document.getElementById('edit-vless-encryption');
+    if (vlessEncEl) vlessEncEl.value = (d.vlessEncryption && d.vlessEncryption !== 'none') ? d.vlessEncryption : '';
+
+    const encSelect = document.getElementById('edit-encryption');
+    const encVal = d.encryption || 'auto';
+    encSelect.value = [...encSelect.options].some(o => o.value === encVal) ? encVal : 'auto';
+    document.getElementById('edit-flow').value = d.flow;
+    document.getElementById('edit-network').value = d.network;
+    // TCP
+    document.getElementById('edit-header-type').value = d.tcpHeaderType || 'none';
+    document.getElementById('edit-tcp-http-host').value = d.tcpHttpHost;
+    document.getElementById('edit-tcp-http-path').value = d.tcpHttpPath;
+    // KCP
+    document.getElementById('edit-kcp-header').value = d.kcpHeader || 'none';
+    document.getElementById('edit-kcp-host').value = d.kcpHost;
+    document.getElementById('edit-kcp-seed').value = d.kcpSeed;
+    // WS
+    document.getElementById('edit-ws-path').value = d.wsPath;
+    document.getElementById('edit-ws-host').value = d.wsHost;
+    // HTTPUpgrade
+    document.getElementById('edit-httpupgrade-host').value = d.httpupgradeHost;
+    document.getElementById('edit-httpupgrade-path').value = d.httpupgradePath;
+    // XHTTP
+    document.getElementById('edit-xhttp-mode').value = d.xhttpMode || 'auto';
+    document.getElementById('edit-xhttp-host').value = d.xhttpHost;
+    document.getElementById('edit-xhttp-path').value = d.xhttpPath;
+    document.getElementById('edit-xhttp-extra').value = d.xhttpExtra;
+    // FinalMask — pretty-printed so a multi-layer mask is readable in the textarea
+    const fmEl = document.getElementById('edit-finalmask');
+    if (fmEl) {
+        let fmText = d.finalMask || "";
+        if (fmText) { try { fmText = JSON.stringify(JSON.parse(fmText), null, 2); } catch(e) {} }
+        fmEl.value = fmText;
+    }
+    // H2
+    document.getElementById('edit-h2-host').value = d.h2Host;
+    document.getElementById('edit-h2-path').value = d.h2Path;
+    // gRPC
+    document.getElementById('edit-grpc-mode').value = d.grpcMode;
+    document.getElementById('edit-grpc-auth').value = d.grpcAuth;
+    document.getElementById('edit-grpc-service').value = d.grpcServiceName;
+    // Security
+    document.getElementById('edit-security').value = d.security;
+    document.getElementById('edit-sni').value = d.sni;
+    document.getElementById('edit-fingerprint').value = d.fingerprint;
+    document.getElementById('edit-alpn').value = d.alpn;
+    document.getElementById('edit-allowinsecure').checked = !!d.allowInsecure;
+    document.getElementById('edit-pcs').value = d.pcs || '';
+    document.getElementById('edit-ech').value = d.ech || '';
+    document.getElementById('edit-vcn').value = d.vcn || '';
+    document.getElementById('edit-pbk').value = d.publicKey;
+    document.getElementById('edit-sid').value = d.shortId;
+    document.getElementById('edit-spx').value = d.spiderX || '';
+    document.getElementById('edit-pqv').value = d.pqv || '';
+    document.getElementById('edit-alterid').value = d.alterId;
+    // WireGuard
+    document.getElementById('edit-wg-secret-key').value = d.wgSecretKey;
+    document.getElementById('edit-wg-public-key').value = d.wgPublicKey;
+    document.getElementById('edit-wg-preshared-key').value = d.wgPresharedKey;
+    document.getElementById('edit-wg-reserved').value = d.wgReserved;
+    document.getElementById('edit-wg-local-address').value = d.wgLocalAddress;
+    document.getElementById('edit-wg-mtu').value = d.wgMTU || 1420;
+    // Hysteria2
+    document.getElementById('edit-hy2-obfs-password').value = d.hy2ObfsPassword;
+    document.getElementById('edit-hy2-port-hopping').value = d.hy2PortHopping;
+    document.getElementById('edit-hy2-hop-interval').value = d.hy2HopInterval;
+    document.getElementById('edit-hy2-bandwidth-down').value = d.hy2BandwidthDown;
+    document.getElementById('edit-hy2-bandwidth-up').value = d.hy2BandwidthUp;
+    document.getElementById('edit-hy2-sni').value = d.hy2Sni;
+    // MASQUE
+    {
+        const mqAlpn = String(d.alpn || '');
+        document.getElementById('edit-masque-alpn').value = (/(^|,)h2(,|$)/.test(mqAlpn) && !/h3/.test(mqAlpn)) ? 'h2' : '';
+        document.getElementById('edit-masque-sni').value = d.sni || '';
+        const mqFp = document.getElementById('edit-masque-fp');
+        mqFp.value = [...mqFp.options].some(o => o.value === d.fingerprint) ? d.fingerprint : 'chrome';
+        document.getElementById('edit-masque-host').value = d.masqueHost || '';
+        document.getElementById('edit-masque-path').value = d.masquePath || '';
+        document.getElementById('edit-masque-headers').value = d.masqueHeaders || '';
+        document.getElementById('edit-masque-dns').value = d.masqueDns || '';
+        document.getElementById('edit-masque-pcs').value = d.pcs || '';
+        document.getElementById('edit-masque-vcn').value = d.vcn || '';
+        document.getElementById('edit-masque-wpk').value = d.masqueWarpPrivateKey || '';
+        document.getElementById('edit-masque-wpub').value = d.masqueWarpPublicKey || '';
+        document.getElementById('edit-masque-address').value = d.masqueAddress || '';
+    }
+    // SOCKS / HTTP proxy auth
+    document.getElementById('edit-proxy-username').value = d.proxyUsername;
+    document.getElementById('edit-proxy-password').value = d.proxyPassword;
+    // SS method
+    const ssMethodSel = document.getElementById('edit-ss-method');
+    if (ssMethodSel) {
+        const ssVal = d.ssMethod || 'aes-256-gcm';
+        ssMethodSel.value = [...ssMethodSel.options].some(o => o.value === ssVal) ? ssVal : 'aes-256-gcm';
+    }
+    // Show/hide standard protocol fields
+    const isSimpleProxy = (proto === 'socks' || proto === 'http');
+    const isWireGuard = (proto === 'wireguard');
+    const isHysteria2 = (proto === 'hysteria2');
+    const isMasque = (proto === 'masque');
+    const isShadowsocks = (proto === 'shadowsocks');
+    const isClassic = (proto === 'vmess' || proto === 'vless' || proto === 'trojan' || proto === 'shadowsocks');
+
+    document.getElementById('field-group-uuid').style.display = (proto === 'wireguard' || proto === 'masque') ? 'none' : 'flex';
+    document.getElementById('field-group-encryption').style.display = (proto === 'vmess') ? 'flex' : 'none';
+    document.getElementById('field-group-flow').style.display = (proto === 'vless') ? 'flex' : 'none';
+    document.getElementById('field-group-vless-encryption').style.display = (proto === 'vless') ? 'flex' : 'none';
+    document.getElementById('field-group-alterid').style.display = (proto === 'vmess') ? 'flex' : 'none';
+    document.getElementById('field-group-ss-method').style.display = isShadowsocks ? 'flex' : 'none';
+
+    // Transport section: only for vmess/vless/trojan
+    document.getElementById('section-transport-wrapper').style.display = isClassic ? 'block' : 'none';
+    // Security section: only for vmess/vless/trojan
+    document.getElementById('section-security-wrapper').style.display = isClassic ? 'block' : 'none';
+    // FinalMask section: classic protocols plus Hysteria2 (quicParams / udpHop /
+    // salamander all live under finalmask for the hysteria transport too).
+    const fmWrap = document.getElementById('section-finalmask-wrapper');
+    if (fmWrap) fmWrap.style.display = (isClassic || isHysteria2 || isMasque) ? 'block' : 'none';
+
+    // WireGuard fields
+    document.getElementById('subfields-wireguard').style.display = isWireGuard ? 'flex' : 'none';
+    // Hysteria2 fields
+    document.getElementById('subfields-hysteria2').style.display = isHysteria2 ? 'flex' : 'none';
+    // MASQUE fields
+    document.getElementById('subfields-masque').style.display = isMasque ? 'flex' : 'none';
+    // Proxy auth fields
+    document.getElementById('subfields-proxy-auth').style.display = (isSimpleProxy || isMasque) ? 'flex' : 'none';
+
+    // UUID label: "Password" for trojan/SS/Hysteria2, "ID" for vmess/vless
+    const uuidLabel = document.querySelector('#edit-uuid')?.closest('.edit-item-field')?.querySelector('label');
+    if (uuidLabel) {
+        if (proto === 'trojan' || proto === 'shadowsocks' || proto === 'hysteria2') {
+            uuidLabel.setAttribute('data-i18n', 'lbl_id');
+        } else if (proto === 'http' || proto === 'socks') {
+        // Hide uuid field entirely for http (auth handled by proxyUsername/Password)
+            uuidLabel.style.display = 'none';
+            document.getElementById('edit-uuid').closest('.edit-item-field').style.display = 'none';
+        } else {
+            uuidLabel.setAttribute('data-i18n', 'lbl_id');
+        }
+    }
+
+    if (isNew) {
+        document.getElementById('modal-edit-title-text').setAttribute('data-i18n', 'modal_edit_title');
+    }
+
+    updateEditFormVisibility();
+    applyI18n();
+    document.getElementById('edit-node-modal').style.display = 'block';
+}
+
+function updateEditFormVisibility() {
+    const net = document.getElementById('edit-network').value;
+    const sec = document.getElementById('edit-security').value;
+    const tcpHeader = document.getElementById('edit-header-type').value;
+
+    // TCP header-type row: only for tcp (and vmess tcp)
+    const showTcpHeaderRow = (net === 'tcp');
+    document.getElementById('field-group-header-type').style.display = showTcpHeaderRow ? 'flex' : 'none';
+    // TCP HTTP subfields: only when tcp + http header
+    document.getElementById('subfields-tcp-http').style.display = (showTcpHeaderRow && tcpHeader === 'http') ? 'flex' : 'none';
+
+    // Per-network subfield panels
+    document.getElementById('subfields-kcp').style.display = (net === 'kcp' || net === 'mkcp') ? 'flex' : 'none';
+    document.getElementById('subfields-ws').style.display = (net === 'ws') ? 'flex' : 'none';
+    document.getElementById('subfields-httpupgrade').style.display = (net === 'httpupgrade') ? 'flex' : 'none';
+    document.getElementById('subfields-xhttp').style.display = (net === 'xhttp' || net === 'splithttp') ? 'flex' : 'none';
+    document.getElementById('subfields-h2').style.display = (net === 'h2' || net === 'http') ? 'flex' : 'none';
+    document.getElementById('subfields-grpc').style.display = (net === 'grpc') ? 'flex' : 'none';
+
+    // Security subfields
+    document.getElementById('subfields-tls').style.display = (sec === 'tls' || sec === 'reality') ? 'flex' : 'none';
+    document.getElementById('subfields-tls-only').style.display = (sec === 'tls') ? 'flex' : 'none';
+    document.getElementById('subfields-reality').style.display = (sec === 'reality') ? 'flex' : 'none';
+
+    // Flow: vless only with tls or reality
+    if (currentEditingProtocol === 'vless') {
+        document.getElementById('field-group-flow').style.display = (sec === 'tls' || sec === 'reality') ? 'flex' : 'none';
+    }
+
+}
+
+function closeEditNodeModal() {
+    document.getElementById('edit-node-modal').style.display = 'none';
+    currentEditingCategory = null;
+    currentEditingNodeId = null;
+    currentEditingProtocol = null;
+}
+
+function _collectEditFormData() {
+    const d = {
+        name: document.getElementById('edit-remarks').value.trim() || "Unnamed Node",
+        address: document.getElementById('edit-address').value.trim(),
+        port: document.getElementById('edit-port').value.trim() || "443",
+        uuid: document.getElementById('edit-uuid').value.trim(),
+        encryption: document.getElementById('edit-encryption').value.trim(),
+        vlessEncryption: (document.getElementById('edit-vless-encryption')?.value || '').trim() || 'none',
+        flow: document.getElementById('edit-flow').value,
+        network: document.getElementById('edit-network').value,
+        // TCP
+        tcpHeaderType: document.getElementById('edit-header-type').value,
+        tcpHttpHost: document.getElementById('edit-tcp-http-host').value.trim(),
+        tcpHttpPath: document.getElementById('edit-tcp-http-path').value.trim() || "/",
+        // KCP
+        kcpHeader: document.getElementById('edit-kcp-header').value,
+        kcpHost: document.getElementById('edit-kcp-host').value.trim(),
+        kcpSeed: document.getElementById('edit-kcp-seed').value.trim(),
+        // WS
+        wsPath: document.getElementById('edit-ws-path').value.trim() || "/",
+        wsHost: document.getElementById('edit-ws-host').value.trim(),
+        // HTTPUpgrade
+        httpupgradeHost: document.getElementById('edit-httpupgrade-host').value.trim(),
+        httpupgradePath: document.getElementById('edit-httpupgrade-path').value.trim() || "/",
+        // XHTTP
+        xhttpMode: document.getElementById('edit-xhttp-mode').value,
+        xhttpHost: document.getElementById('edit-xhttp-host').value.trim(),
+        xhttpPath: document.getElementById('edit-xhttp-path').value.trim() || "/",
+        xhttpExtra: document.getElementById('edit-xhttp-extra').value.trim(),
+        // FinalMask — stored minified; the textarea holds the pretty-printed form
+        finalMask: (() => {
+            const raw = (document.getElementById('edit-finalmask')?.value || "").trim();
+            if (!raw) return "";
+            try { return JSON.stringify(JSON.parse(raw)); } catch (e) { return raw; }
+        })(),
+        // H2
+        h2Host: document.getElementById('edit-h2-host').value.trim(),
+        h2Path: document.getElementById('edit-h2-path').value.trim() || "/",
+        // gRPC
+        grpcMode: document.getElementById('edit-grpc-mode').value,
+        grpcAuth: document.getElementById('edit-grpc-auth').value.trim(),
+        grpcServiceName: document.getElementById('edit-grpc-service').value.trim(),
+        // Security
+        security: document.getElementById('edit-security').value,
+        sni: document.getElementById('edit-sni').value.trim(),
+        fingerprint: document.getElementById('edit-fingerprint').value,
+        alpn: document.getElementById('edit-alpn').value.trim(),
+        // "allowInsecure" was removed by Xray-core; always save as false, ignoring the (disabled) checkbox.
+        allowInsecure: false,
+        pcs: document.getElementById('edit-pcs').value.trim(),
+        ech: document.getElementById('edit-ech').value.trim(),
+        vcn: document.getElementById('edit-vcn').value.trim(),
+        publicKey: document.getElementById('edit-pbk').value.trim(),
+        shortId: document.getElementById('edit-sid').value.trim(),
+        spiderX: document.getElementById('edit-spx').value.trim(),
+        pqv: document.getElementById('edit-pqv').value.trim(),
+        alterId: document.getElementById('edit-alterid').value.trim() || "0",
+        headerType: document.getElementById('edit-header-type').value,
+        // WireGuard
+        wgSecretKey: document.getElementById('edit-wg-secret-key').value.trim(),
+        wgPublicKey: document.getElementById('edit-wg-public-key').value.trim(),
+        wgPresharedKey: document.getElementById('edit-wg-preshared-key').value.trim(),
+        wgReserved: document.getElementById('edit-wg-reserved').value.trim(),
+        wgLocalAddress: document.getElementById('edit-wg-local-address').value.trim() || "172.16.0.2/32",
+        wgMTU: parseInt(document.getElementById('edit-wg-mtu').value, 10) || 1420,
+        // Hysteria2
+        hy2ObfsPassword: document.getElementById('edit-hy2-obfs-password').value.trim(),
+        hy2PortHopping: document.getElementById('edit-hy2-port-hopping').value.trim(),
+        hy2HopInterval: document.getElementById('edit-hy2-hop-interval').value.trim(),
+        hy2BandwidthDown: document.getElementById('edit-hy2-bandwidth-down').value.trim(),
+        hy2BandwidthUp: document.getElementById('edit-hy2-bandwidth-up').value.trim(),
+        hy2Sni: document.getElementById('edit-hy2-sni').value.trim(),
+        // SOCKS/HTTP proxy auth
+        proxyUsername: document.getElementById('edit-proxy-username').value.trim(),
+        proxyPassword: document.getElementById('edit-proxy-password').value.trim(),
+        // Shadowsocks
+        ssMethod: document.getElementById('edit-ss-method').value,
+        // MASQUE
+        masqueHost: document.getElementById('edit-masque-host').value.trim(),
+        masquePath: document.getElementById('edit-masque-path').value.trim(),
+        masqueHeaders: (() => {
+            const raw = (document.getElementById('edit-masque-headers').value || "").trim();
+            if (!raw) return "";
+            try { return JSON.stringify(JSON.parse(raw)); } catch (e) { return raw; }
+        })(),
+        masqueDns: document.getElementById('edit-masque-dns').value.trim(),
+        masqueWarpPrivateKey: document.getElementById('edit-masque-wpk').value.trim(),
+        masqueWarpPublicKey: document.getElementById('edit-masque-wpub').value.trim(),
+        masqueAddress: document.getElementById('edit-masque-address').value.trim()
+    };
+    if (currentEditingProtocol === 'masque') {
+        // MASQUE has its own TLS inputs (the generic Security section is hidden).
+        d.uuid = "";
+        d.security = 'tls';
+        d.sni = document.getElementById('edit-masque-sni').value.trim();
+        d.alpn = document.getElementById('edit-masque-alpn').value;
+        d.fingerprint = document.getElementById('edit-masque-fp').value;
+        d.pcs = document.getElementById('edit-masque-pcs').value.trim();
+        d.vcn = document.getElementById('edit-masque-vcn').value.trim();
+        d.ech = "";
+    }
+    return d;
+}
+
+function saveEditedNode() {
+    if (!currentEditingCategory || !currentEditingNodeId) return;
+
+    const isNew = currentEditingNodeId.startsWith('__new__');
+    const d = _collectEditFormData();
+
+    // FinalMask must be a JSON object, otherwise it would be silently dropped
+    // when the link is rebuilt — tell the user instead of losing their input.
+    if (d.finalMask) {
+        let fmOk = false;
+        try {
+            const parsed = JSON.parse(d.finalMask);
+            fmOk = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+        } catch (e) { fmOk = false; }
+        if (!fmOk) return showToast(t('toast_finalmask_invalid'), "error");
+    }
+
+    // MASQUE extra headers must be a JSON object, otherwise they would be
+    // silently dropped when the config is generated.
+    if (currentEditingProtocol === 'masque' && d.masqueHeaders) {
+        let hOk = false;
+        try {
+            const parsed = JSON.parse(d.masqueHeaders);
+            hOk = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+        } catch (e) { hOk = false; }
+        if (!hOk) return showToast(t('toast_masque_headers_invalid'), "error");
+    }
+
+    const proto = currentEditingProtocol;
+    const newUri = serializeNodeDetailsToUri(d, proto);
+
+    // Determine security/uuid for stored node summary
+    let storedSecurity = d.security;
+    let storedUuid = d.uuid;
+    if (proto === 'shadowsocks') { storedSecurity = d.ssMethod; storedUuid = d.uuid; }
+    if (proto === 'hysteria2' || proto === 'masque') { storedSecurity = 'tls'; }
+
+    const nodeEntry = {
+        id: isNew ? Math.random().toString(36).substr(2, 9) : currentEditingNodeId,
+        name: d.name,
+        protocol: proto,
+        address: d.address,
+        port: d.port,
+        uuid: storedUuid,
+        security: storedSecurity,
+        rawUri: newUri
+    };
+
+    const destCat = document.getElementById('edit-node-category').value || currentEditingCategory;
+    let wasActive = !isNew && activeConfig === `${currentEditingCategory}:${currentEditingNodeId}`;
+
+    if (isNew) {
+        if (!profiles[destCat]) profiles[destCat] = { url: null, nodes: [] };
+        profiles[destCat].nodes.push(nodeEntry);
+        showToast(t('toast_new_node_saved'), "success");
+    } else {
+        const nodeIdx = profiles[currentEditingCategory]?.nodes?.findIndex(n => n.id === currentEditingNodeId);
+        if (nodeIdx === -1) return;
+        if (destCat === currentEditingCategory) {
+            profiles[currentEditingCategory].nodes[nodeIdx] = nodeEntry;
+        } else {
+            // Moved to another category while editing. Ids are only unique
+            // within a category, so re-issue one on collision.
+            if (!profiles[destCat]) profiles[destCat] = { url: null, nodes: [] };
+            if (profiles[destCat].nodes.some(n => n.id === nodeEntry.id)) {
+                nodeEntry.id = Math.random().toString(36).substr(2, 9);
+            }
+            profiles[currentEditingCategory].nodes.splice(nodeIdx, 1);
+            profiles[destCat].nodes.push(nodeEntry);
+            categoryExpandedState[destCat] = true;
+            if (wasActive) {
+                activeConfig = `${destCat}:${nodeEntry.id}`;
+                saveActiveConfig();
+            }
+        }
+    }
+
+    saveProfiles();
+    closeEditNodeModal();
+    renderProfiles();
+
+    if (wasActive) applyActiveConfig();
+}
+
+function openEditSubModal(category) {
+    const catData = profiles[category];
+    if (!catData) return;
+
+    document.getElementById('edit-sub-cat-name').value = category;
+    document.getElementById('edit-sub-url').value = catData.url || '';
+    document.getElementById('edit-sub-dedup').checked = catData.dedup !== false; // default true
+    document.getElementById('edit-sub-insecure').checked = catData.insecure === true; // default false
+    document.getElementById('edit-sub-useragent').value = catData.useragent || DEFAULT_SUB_USERAGENT;
+    document.getElementById('edit-sub-modal').dataset.originalCat = category;
+    document.getElementById('edit-sub-modal').style.display = 'block';
+}
+
+function closeEditSubModal() {
+    document.getElementById('edit-sub-modal').style.display = 'none';
+}
+
+function saveEditedSubscription() {
+    const modal = document.getElementById('edit-sub-modal');
+    const originalCat = modal.dataset.originalCat;
+    const newName = document.getElementById('edit-sub-cat-name').value.trim();
+    const newUrl = document.getElementById('edit-sub-url').value.trim();
+    const newDedup = document.getElementById('edit-sub-dedup').checked;
+    const newInsecure = document.getElementById('edit-sub-insecure').checked;
+    const newUserAgent = document.getElementById('edit-sub-useragent').value.trim() || DEFAULT_SUB_USERAGENT;
+
+    if (!newName) return;
+    if (!profiles[originalCat]) return;
+    if (newName !== originalCat) {
+        if (newName.indexOf(':') !== -1) return showToast(t('toast_category_bad_name'), 'error');
+        if (profiles[newName]) return showToast(t('toast_category_exists'), 'error');
+    }
+
+    // Rename category if name changed
+    if (newName !== originalCat) {
+        Object.keys(profiles).forEach(c => (profiles[c].nodes || []).forEach(n => { if (_isGroupNode(n) && n.pg.source === originalCat) n.pg.source = newName; }));
+        writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)));
+        profiles[newName] = { ...profiles[originalCat] };
+        delete profiles[originalCat];
+
+        // Update activeConfig if it referenced old category name
+        if (activeConfig && activeConfig.startsWith(originalCat + ':')) {
+            activeConfig = newName + ':' + activeConfig.split(':')[1];
+            saveActiveConfig();
+        }
+    }
+
+    profiles[newName].url = newUrl || null;
+    profiles[newName].dedup = newDedup;
+    profiles[newName].insecure = newInsecure;
+    profiles[newName].useragent = newUserAgent;
+
+    saveProfiles();
+    closeEditSubModal();
+    renderProfiles();
+}
+
+function deduplicateCategory(category) {
+    const catData = profiles[category];
+    if (!catData || !catData.nodes) return;
+
+    const seen = new Set();
+    const before = catData.nodes.length;
+    catData.nodes = catData.nodes.filter(node => {
+        const key = buildNodeKey(node);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    const removed = before - catData.nodes.length;
+
+    // If active node was removed, clear it
+    if (activeConfig && activeConfig.startsWith(category + ':')) {
+        const [_, currentId] = activeConfig.split(':');
+        if (!catData.nodes.some(n => n.id === currentId)) {
+            activeConfig = null;
+            saveActiveConfig();
+        }
+    }
+
+    saveProfiles();
+    renderProfiles();
+    showToast(t('toast_dedup_done', { removed, total: catData.nodes.length }), removed > 0 ? 'success' : 'info');
+}
+
+function closeAllMenus() {
+    document.querySelectorAll('.category-dropdown-menu').forEach(menu => menu.classList.remove('show'));
+    document.querySelectorAll('.node-dropdown-menu').forEach(menu => menu.classList.remove('show'));
+    closeImportAddMenu();
+    closeTabMenu();
+}
+
+function toggleTabMenu(event) {
+    event.stopPropagation();
+    const menu = document.getElementById('tab-menu');
+    const isOpen = menu.classList.contains('show');
+    closeAllMenus();
+    if (!isOpen) {
+        menu.classList.add('show');
+        document.getElementById('tab-menu-btn').setAttribute('aria-expanded', 'true');
+        const current = menu.querySelector('.tab-menu-item.active') || menu.querySelector('.tab-menu-item');
+        if (current) current.focus();
+    }
+}
+
+function closeTabMenu() {
+    const menu = document.getElementById('tab-menu');
+    if (menu) menu.classList.remove('show');
+    const btn = document.getElementById('tab-menu-btn');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+
+// Keyboard support for the tab menu: Esc closes and returns focus to the
+// button, arrow keys / Home / End move between items.
+document.addEventListener('keydown', (e) => {
+    const menu = document.getElementById('tab-menu');
+    if (!menu || !menu.classList.contains('show')) return;
+    if (e.key === 'Escape') {
+        closeTabMenu();
+        document.getElementById('tab-menu-btn').focus();
+        return;
+    }
+    const items = Array.from(menu.querySelectorAll('.tab-menu-item'));
+    const i = items.indexOf(document.activeElement);
+    let next = -1;
+    if (e.key === 'ArrowDown') next = (i + 1) % items.length;
+    else if (e.key === 'ArrowUp') next = (i - 1 + items.length) % items.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    if (next >= 0) {
+        e.preventDefault();
+        items[next].focus();
+    }
+});
+
+function toggleImportAddMenu(event) {
+    event.stopPropagation();
+    const dropdown = document.getElementById('import-add-dropdown');
+    const isOpen = dropdown.classList.contains('show');
+    closeAllMenus();
+    if (!isOpen) {
+        dropdown.classList.add('show');
+    }
+}
+
+function closeImportAddMenu() {
+    const dropdown = document.getElementById('import-add-dropdown');
+    if (dropdown) dropdown.classList.remove('show');
+}
+
+// Proxy Chain Modal
+
+function _getAllNodeOptions() {
+    const options = [];
+    Object.keys(profiles).forEach(category => {
+        const nodes = profiles[category]?.nodes;
+        if (!nodes || nodes.length === 0) return;
+        nodes.forEach(node => {
+            // Chain nodes cannot be used as hops inside another chain
+            if (node.protocol === 'chain') return;
+            options.push({
+                value: `${category}:${node.id}`,
+                label: `[${category}] ${node.name || node.address} — ${(node.protocol || '').toUpperCase()}`
+            });
+        });
+    });
+    return options;
+}
+
+function _populateChainSelects() {
+    const opts = _getAllNodeOptions();
+    ['chain-hop1', 'chain-hop2'].forEach(selId => {
+        const sel = document.getElementById(selId);
+        if (!sel) return;
+        const prev = sel.value;
+        sel.innerHTML = `<option value="">${t('chain_select_node')}</option>`;
+        opts.forEach(o => {
+            const opt = document.createElement('option');
+            opt.value = o.value;
+            opt.textContent = o.label;
+            sel.appendChild(opt);
+        });
+        if (prev) sel.value = prev;
+    });
+}
+
+function openProxyChainModal() {
+    _populateChainSelects();
+    document.getElementById('chain-name').value = '';
+    document.getElementById('chain-hop1').value = '';
+    document.getElementById('chain-hop2').value = '';
+    const modal = document.getElementById('proxy-chain-modal');
+    delete modal.dataset.editingId;
+    delete modal.dataset.editingCat;
+    applyI18n();
+    modal.style.display = 'block';
+}
+
+function closeProxyChainModal() {
+    const modal = document.getElementById('proxy-chain-modal');
+    modal.style.display = 'none';
+    delete modal.dataset.editingId;
+    delete modal.dataset.editingCat;
+}
+
+function saveProxyChain() {
+    const hop1Key = document.getElementById('chain-hop1').value;
+    const hop2Key = document.getElementById('chain-hop2').value;
+
+    if (!hop1Key || !hop2Key) {
+        showToast(t('toast_chain_select_nodes'), 'error');
+        return;
+    }
+    if (hop1Key === hop2Key) {
+        showToast(t('toast_chain_same_node'), 'error');
+        return;
+    }
+
+    const [cat1, id1] = hop1Key.split(':');
+    const [cat2, id2] = hop2Key.split(':');
+    const hop1Node = profiles[cat1]?.nodes?.find(n => n.id === id1);
+    const hop2Node = profiles[cat2]?.nodes?.find(n => n.id === id2);
+    if (!hop1Node || !hop2Node) return;
+
+    // Chain nodes cannot be used as hops inside another chain
+    if (hop1Node.protocol === 'chain' || hop2Node.protocol === 'chain') {
+        showToast(t('toast_chain_no_chain_hop'), 'error');
+        return;
+    }
+
+    const chainName = document.getElementById('chain-name').value.trim()
+        || `${hop1Node.name || hop1Node.address} → ${hop2Node.name || hop2Node.address}`;
+
+    // Store chain as a synthetic node in Manual category
+    if (!profiles['Manual']) profiles['Manual'] = { url: null, nodes: [] };
+
+    // If editing an existing chain node, update it in-place
+    const editingId = document.getElementById('proxy-chain-modal').dataset.editingId;
+    const editingCat = document.getElementById('proxy-chain-modal').dataset.editingCat;
+
+    const chainEntry = {
+        id: editingId || Math.random().toString(36).substr(2, 9),
+        name: chainName,
+        protocol: 'chain',
+        address: hop2Node.address,
+        port: hop2Node.port,
+        uuid: '',
+        security: '',
+        rawUri: `chain://localhost/?hop1=${encodeURIComponent(hop1Node.rawUri)}&hop2=${encodeURIComponent(hop2Node.rawUri)}`
+    };
+
+    if (editingId && editingCat) {
+        const idx = profiles[editingCat]?.nodes?.findIndex(n => n.id === editingId);
+        if (idx !== undefined && idx !== -1) {
+            profiles[editingCat].nodes[idx] = chainEntry;
+            // Regenerate config if this chain is active
+            if (activeConfig === `${editingCat}:${editingId}`) {
+                applyActiveConfig();
+            }
+        }
+    } else {
+        profiles['Manual'].nodes.push(chainEntry);
+    }
+
+    saveProfiles();
+    closeProxyChainModal();
+    renderProfiles();
+    showToast(t('toast_chain_saved'), 'success');
+}
+
+function openProxyChainEditModal(event, category, id) {
+    event.stopPropagation();
+    closeAllMenus();
+    const node = profiles[category]?.nodes?.find(n => n.id === id);
+    if (!node || node.protocol !== 'chain') return;
+
+    _populateChainSelects();
+
+    // Pre-fill the modal with existing chain data
+    document.getElementById('chain-name').value = node.name || '';
+
+    // Parse hop URIs out of rawUri to match selects
+    try {
+        const fakeRawUri = node.rawUri.replace(/^chain:\/\//i, 'https://');
+        const u = new URL(fakeRawUri);
+        const hop1Uri = u.searchParams.get('hop1') || '';
+        const hop2Uri = u.searchParams.get('hop2') || '';
+
+        // Match URIs back to category:id keys
+        const opts = _getAllNodeOptions();
+        let hop1Key = '', hop2Key = '';
+        Object.keys(profiles).forEach(cat => {
+            profiles[cat]?.nodes?.forEach(n => {
+                if (n.rawUri === hop1Uri) hop1Key = `${cat}:${n.id}`;
+                if (n.rawUri === hop2Uri) hop2Key = `${cat}:${n.id}`;
+            });
+        });
+        document.getElementById('chain-hop1').value = hop1Key;
+        document.getElementById('chain-hop2').value = hop2Key;
+    } catch(e) {}
+
+    // Store editing context on the modal element
+    document.getElementById('proxy-chain-modal').dataset.editingId = id;
+    document.getElementById('proxy-chain-modal').dataset.editingCat = category;
+
+    applyI18n();
+    document.getElementById('proxy-chain-modal').style.display = 'block';
+}
+
+async function importFromClipboard() {
+    try {
+        const text = await navigator.clipboard.readText();
+        if (!text || !text.trim()) {
+            showToast(t('toast_clipboard_empty'), 'error');
+            return;
+        }
+        const uris = extractUrisFromText(text.trim());
+        if (uris.length === 0) {
+            showToast(t('toast_no_configs_extracted'), 'error');
+            return;
+        }
+        parseAndAppendNodes('Manual', uris, null);
+        showToast(t('toast_clipboard_imported', { count: uris.length }), 'success');
+    } catch(e) {
+        showToast(t('toast_clipboard_empty'), 'error');
+    }
+}
+
+function importFromFile() {
+    document.getElementById('import-file-input').click();
+}
+
+function handleFileImport(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const text = e.target.result;
+        const uris = extractUrisFromText(text);
+        if (uris.length === 0) {
+            showToast(t('toast_no_configs_extracted'), 'error');
+        } else {
+            parseAndAppendNodes('Manual', uris, null);
+        }
+    };
+    reader.readAsText(file);
+    // Reset so same file can be imported again
+    event.target.value = '';
+}
+
+document.addEventListener('click', () => {
+    closeAllMenus();
+});
+
+// ---------------------------------------------------------------------------
+// Background-work gating.
+//
+// Every recurring task in this UI drives a root shell exec, and some of them
+// drive a network probe on the device. None of that should keep running when
+// the user is not looking at it. Two levels:
+//
+//   * visibilitychange - the WebUI is backgrounded (home button, app switch).
+//     Timers are suspended; the backend latency probe then stops on its own
+//     once its heartbeat goes stale.
+//   * pagehide - the WebUI is being torn down. Stop the backend probe
+//     explicitly rather than waiting for the heartbeat timeout.
+// ---------------------------------------------------------------------------
+function _suspendBackgroundWork() {
+    stopLatencyPolling();
+    stopLogAutoRefresh();
+}
+
+function _resumeBackgroundWork() {
+    const activeTab = document.querySelector('.tab-content.active')?.id;
+    if (activeTab === 'tab-latency') {
+        syncLatencyMonitorState();
+    } else if (activeTab === 'tab-log') {
+        startLogAutoRefresh();
+    }
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        _suspendBackgroundWork();
+    } else {
+        _resumeBackgroundWork();
+    }
+});
+
+window.addEventListener('pagehide', () => {
+    _suspendBackgroundWork();
+    // Best-effort: the exec may not complete if we are killed immediately,
+    // which is exactly why the backend also self-terminates on heartbeat
+    // timeout rather than relying on this.
+    if (_isLatencyTabActive()) {
+        execShell(`sh ${MODDIR}/proxy_control.sh stop_monitor_latency`, () => {});
+    }
+});
+ 
+// NOTE: the profile/node list is now built with createElement + textContent,
+// so no manual escaping is needed there. escapeAttr() was deleted outright —
+// it only escaped ' and was being interpolated into "-quoted attributes,
+// which was the XSS vector. Do not reintroduce string-built event handlers.
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+ 
+function switchTab(tabId, evt) {
+    const prevTabId = document.querySelector('.tab-content.active')?.id;
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-menu-item').forEach(el => {
+        el.classList.remove('active');
+        el.removeAttribute('aria-current');
+    });
+
+    document.getElementById(tabId).classList.add('active');
+    // Was reading the deprecated global `event`, which is undefined in strict
+    // mode and on non-Chromium engines. Fall back to matching by tab id.
+    const trigger = (evt && evt.currentTarget)
+        || document.querySelector(`.tab-menu-item[data-tab="${tabId}"]`);
+    if (trigger) {
+        trigger.classList.add('active');
+        trigger.setAttribute('aria-current', 'page');
+    }
+
+    if (tabId === 'tab-log') {
+        startLogAutoRefresh();
+    } else {
+        stopLogAutoRefresh();
+    }
+
+    // The latency monitor lives exactly as long as its tab is open: started
+    // on entry, stopped on exit (re-clicking the current tab changes nothing).
+    if (tabId === 'tab-latency') {
+        if (prevTabId !== 'tab-latency') startLatencyMonitor();
+        syncIpHunterState();
+    } else if (prevTabId === 'tab-latency') {
+        stopLatencyMonitor();
+    }
+
+    if (tabId === 'tab-routing') {
+        renderRoutingRules();
+    }
+
+    // Interfaces come and go (Wi-Fi off, hotspot on), so re-list them each
+    // time the Network tab is opened.
+    if (tabId === 'tab-network' && prevTabId !== 'tab-network') {
+        refreshUpstreamIfaceOptions(document.getElementById('set-upstreamiface')?.value);
+    }
+
+    if (tabId === 'tab-hosts') {
+        onHostsTabOpened();
+    }
+
+    if (tabId === 'tab-exclude') {
+        onExcludeTabOpened();
+    }
+
+    if (tabId === 'tab-about') {
+        onAboutTabOpened();
+    }
+}
+
+// ===== About tab =====
+// Static content lives in index.html; URLs live in ABOUT_LINKS (vars.js).
+// One-shot setup on first open: fill in the hrefs (hiding any row whose URL
+// is empty, e.g. the Telegram group until its link is set) and read the
+// module version from module.prop.
+let _aboutInited = false;
+
+function onAboutTabOpened() {
+    if (_aboutInited) return;
+    _aboutInited = true;
+
+    document.querySelectorAll('[data-about-link]').forEach(el => {
+        const url = ABOUT_LINKS[el.dataset.aboutLink];
+        if (!/^https?:\/\/\S+$/i.test(url || '')) {
+            el.hidden = true;
+            return;
+        }
+        el.href = url;
+    });
+
+    execShell(`grep -m1 '^version=' ${shQuote(MODDIR + '/module.prop')} | cut -d= -f2-`, (out) => {
+        const version = (out || '').trim();
+        if (!version || version === 'ERROR') return;
+        document.getElementById('about-version').textContent = version;
+        document.getElementById('about-version-row').hidden = false;
+    });
+}
+
+// WebUI WebViews don't reliably hand target=_blank links to a browser, so go
+// through the root shell (we already have one) and only fall back to
+// window.open if that doesn't report success. Only http(s) URLs pass.
+function openExternalLink(event, el) {
+    event.preventDefault();
+    const url = el.getAttribute('href') || '';
+    if (!/^https?:\/\/[^\s'"]+$/i.test(url)) return;
+    execShell(
+        `am start --user 0 -a android.intent.action.VIEW -d ${shQuote(url)} >/dev/null 2>&1 && echo ok`,
+        (out) => {
+            if (out !== 'ok') window.open(url, '_blank', 'noopener');
+        }
+    );
+}
+
+function toggleSubSettingField(triggerId, subPanelId) {
+    const isChecked = document.getElementById(triggerId).checked;
+    document.getElementById(subPanelId).style.display = isChecked ? 'block' : 'none';
+}
+
+function updateDnsGroupVisibility() {
+    const localDnsOn = document.getElementById('set-localdns').checked;
+    const hijackDnsOn = document.getElementById('set-hijackdns').checked;
+
+    const subFields = document.getElementById('dns-sub-fields');
+    subFields.style.display = localDnsOn ? '' : 'none';
+
+    // Fake DNS depends on Local DNS and needs Hijack DNS enabled to take effect
+    const fakeDnsRow = document.getElementById('dns-row-fakedns-local');
+    const fakeDnsHijackHint = document.getElementById('fakedns-hijack-hint');
+    if (localDnsOn && hijackDnsOn) {
+        fakeDnsRow.classList.remove('setting-row-disabled');
+        document.getElementById('set-fakedns-local').disabled = false;
+        if (fakeDnsHijackHint) fakeDnsHijackHint.style.display = 'none';
+    } else {
+        fakeDnsRow.classList.add('setting-row-disabled');
+        document.getElementById('set-fakedns-local').disabled = true;
+        if (localDnsOn && !hijackDnsOn && fakeDnsHijackHint) {
+            fakeDnsHijackHint.style.display = '';
+        } else if (fakeDnsHijackHint) {
+            fakeDnsHijackHint.style.display = 'none';
+        }
+    }
+}
+
+// ===== DNS servers modal =====
+// Three editable lists (Direct DNS, domains answered by Direct DNS, Proxy DNS)
+// kept on advSettings as comma-separated strings: directDns,
+// directDnsDomains, foreignDns. The modal works on a draft; the check button
+// commits it to advSettings, and "Save & apply" on the Traffic tab persists it.
+
+// Settings saved by older versions had one `domesticDns` string and no
+// domain list. Converts once; the old key is dropped on the next save.
+function migrateDnsSettings() {
+    if (typeof advSettings.directDns !== 'string') {
+        advSettings.directDns = typeof advSettings.domesticDns === 'string'
+            ? advSettings.domesticDns : "quic+local://223.5.5.5";
+    }
+    delete advSettings.domesticDns;
+    if (typeof advSettings.directDnsDomains !== 'string') {
+        advSettings.directDnsDomains = DEFAULT_DIRECT_DNS_DOMAINS;
+    }
+    if (typeof advSettings.foreignDns !== 'string') {
+        advSettings.foreignDns = DEFAULT_FOREIGN_DNS;
+    }
+}
+
+const DNS_LIST_DEFS = [
+    { key: 'direct',  field: 'directDns',        title: 'dns_card_direct',  desc: 'dns_card_direct_desc',  ph: 'quic+local://223.5.5.5' },
+    { key: 'domains', field: 'directDnsDomains', title: 'dns_card_domains', desc: 'dns_card_domains_desc', ph: 'geosite:cn' },
+    { key: 'proxy',   field: 'foreignDns',       title: 'dns_card_proxy',   desc: 'dns_card_proxy_desc',   ph: 'https://8.8.8.8/dns-query' },
+];
+
+const _DNS_SVG = (inner) => '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+const DNS_ICON_EDIT = _DNS_SVG('<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>');
+const DNS_ICON_CHECK = _DNS_SVG('<polyline points="20 6 9 17 4 12"/>');
+const DNS_ICON_PLUS = _DNS_SVG('<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>');
+const DNS_ICON_DELETE = _DNS_SVG('<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>');
+
+let dnsDraft = null;   // { direct: [], domains: [], proxy: [] } while the modal is open
+let dnsCards = {};     // key -> { textarea, bulk, renderList }
+
+// Splits typed/pasted text into clean, de-duplicated entries. DNS addresses
+// and domain rules never contain spaces or commas, so both are separators.
+function parseDnsEntries(str) {
+    return [...new Set(String(str || '').split(/[\s,]+/).map(s => s.trim()).filter(Boolean))];
+}
+
+function updateDnsSummary() {
+    const el = document.getElementById('dns-servers-summary');
+    if (!el) return;
+    el.textContent = t('dns_summary', {
+        direct: parseDnsEntries(advSettings.directDns).length,
+        domains: parseDnsEntries(advSettings.directDnsDomains).length,
+        proxy: parseDnsEntries(advSettings.foreignDns).length
+    });
+}
+
+function _dnsEl(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+}
+
+function _dnsIconBtn(svg, title, onClick, extraCls) {
+    const b = _dnsEl('button', 'dns-icon-btn' + (extraCls ? ' ' + extraCls : ''));
+    b.type = 'button';
+    b.title = title;
+    b.innerHTML = svg;   // constant SVG markup only, never user data
+    b.onclick = onClick;
+    return b;
+}
+
+function openDnsModal() {
+    migrateDnsSettings();
+    dnsDraft = {};
+    DNS_LIST_DEFS.forEach(d => { dnsDraft[d.key] = parseDnsEntries(advSettings[d.field]); });
+    dnsCards = {};
+    const body = document.getElementById('dns-modal-body');
+    body.innerHTML = '';
+    DNS_LIST_DEFS.forEach(d => body.appendChild(_buildDnsCard(d)));
+    document.getElementById('dns-modal').style.display = 'block';
+}
+
+function closeDnsModal() {
+    document.getElementById('dns-modal').style.display = 'none';
+    dnsDraft = null;
+    dnsCards = {};
+}
+
+function saveDnsModal() {
+    if (!dnsDraft) return;
+    DNS_LIST_DEFS.forEach(d => {
+        const c = dnsCards[d.key];
+        if (c && c.bulk) dnsDraft[d.key] = parseDnsEntries(c.textarea.value);
+        advSettings[d.field] = dnsDraft[d.key].join(', ');
+    });
+    updateDnsSummary();
+    closeDnsModal();
+    showToast(t('toast_dns_staged'), 'success');
+}
+
+function _buildDnsCard(def) {
+    const card = _dnsEl('div', 'dns-card');
+    const state = { textarea: null, bulk: false, renderList: null };
+    dnsCards[def.key] = state;
+
+    // Header: title + "edit all as text" toggle
+    const head = _dnsEl('div', 'dns-card-head');
+    const titleWrap = _dnsEl('div', 'dns-card-titlewrap');
+    titleWrap.appendChild(_dnsEl('div', 'dns-card-title', t(def.title)));
+    titleWrap.appendChild(_dnsEl('div', 'dns-card-desc', t(def.desc)));
+    head.appendChild(titleWrap);
+    card.appendChild(head);
+
+    // Add row
+    const addRow = _dnsEl('div', 'dns-add-row');
+    const addInput = _dnsEl('input', 'dns-add-input');
+    addInput.type = 'text';
+    addInput.placeholder = def.ph;
+    addInput.autocapitalize = 'off';
+    addInput.autocomplete = 'off';
+    addInput.spellcheck = false;
+    const doAdd = () => {
+        const toAdd = parseDnsEntries(addInput.value);
+        if (!toAdd.length) return;
+        dnsDraft[def.key] = [...new Set([...dnsDraft[def.key], ...toAdd])];
+        addInput.value = '';
+        state.renderList();
+    };
+    addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doAdd(); } });
+    addRow.appendChild(addInput);
+    addRow.appendChild(_dnsIconBtn(DNS_ICON_PLUS, t('dns_btn_add'), doAdd));
+    card.appendChild(addRow);
+
+    // List
+    const list = _dnsEl('div', 'dns-list');
+    card.appendChild(list);
+
+    // Bulk (text) editor, hidden until the header icon is pressed
+    const textarea = _dnsEl('textarea', 'dns-bulk');
+    textarea.placeholder = t('dns_bulk_ph');
+    textarea.spellcheck = false;
+    textarea.style.display = 'none';
+    state.textarea = textarea;
+    card.appendChild(textarea);
+
+    const bulkBtn = _dnsIconBtn(DNS_ICON_EDIT, t('dns_btn_edit_all'), () => {
+        if (!state.bulk) {
+            state.bulk = true;
+            textarea.value = dnsDraft[def.key].join('\n');
+            addRow.style.display = 'none';
+            list.style.display = 'none';
+            textarea.style.display = '';
+            bulkBtn.innerHTML = DNS_ICON_CHECK;
+            bulkBtn.title = t('dns_btn_done');
+            textarea.focus();
+        } else {
+            state.bulk = false;
+            dnsDraft[def.key] = parseDnsEntries(textarea.value);
+            textarea.style.display = 'none';
+            addRow.style.display = '';
+            list.style.display = '';
+            bulkBtn.innerHTML = DNS_ICON_EDIT;
+            bulkBtn.title = t('dns_btn_edit_all');
+            state.renderList();
+        }
+    });
+    head.appendChild(bulkBtn);
+
+    state.renderList = () => {
+        list.innerHTML = '';
+        const items = dnsDraft[def.key];
+        if (!items.length) {
+            list.appendChild(_dnsEl('div', 'dns-empty',
+                def.key === 'domains' ? t('hint_dns_domains_empty') : t('dns_list_empty')));
+            return;
+        }
+        items.forEach((value, idx) => list.appendChild(_buildDnsItem(def, value, idx, state)));
+    };
+    state.renderList();
+    return card;
+}
+
+function _buildDnsItem(def, value, idx, state) {
+    const row = _dnsEl('div', 'dns-item');
+    const text = _dnsEl('div', 'dns-item-text', value);
+    row.appendChild(text);
+
+    let editing = false;
+    let input = null;
+    const editBtn = _dnsIconBtn(DNS_ICON_EDIT, t('dns_btn_edit_item'), () => {
+        if (!editing) {
+            editing = true;
+            input = _dnsEl('input', 'dns-item-input');
+            input.type = 'text';
+            input.value = value;
+            input.autocapitalize = 'off';
+            input.spellcheck = false;
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); editBtn.click(); }
+                else if (e.key === 'Escape') { state.renderList(); }
+            });
+            row.replaceChild(input, text);
+            editBtn.innerHTML = DNS_ICON_CHECK;
+            input.focus();
+            input.select();
+        } else {
+            const parts = parseDnsEntries(input.value);
+            if (parts.length) {
+                const next = dnsDraft[def.key].slice();
+                next.splice(idx, 1, ...parts);
+                dnsDraft[def.key] = [...new Set(next)];
+            }
+            state.renderList();
+        }
+    });
+    const delBtn = _dnsIconBtn(DNS_ICON_DELETE, t('btn_delete'), () => {
+        dnsDraft[def.key] = dnsDraft[def.key].filter((_, i) => i !== idx);
+        state.renderList();
+    }, 'btn-delete-item');
+    row.appendChild(editBtn);
+    row.appendChild(delBtn);
+    return row;
+}
+
+// Grey out DNS engine options that have no effect given the others:
+// serveStale needs the cache, its TTL needs serveStale, and
+// disableFallbackIfMatch is moot once fallback is fully disabled.
+function syncDnsEngineOptions() {
+    const on = id => { const e = document.getElementById(id); return !!(e && e.checked); };
+    const setDisabled = (rowId, inputId, disabled) => {
+        const row = document.getElementById(rowId);
+        const inp = document.getElementById(inputId);
+        if (row) row.classList.toggle('setting-row-disabled', disabled);
+        if (inp) inp.disabled = disabled;
+    };
+    const noCache = on('set-dns-disablecache');
+    const noStale = noCache || !on('set-dns-servestale');
+    setDisabled('row-dns-servestale', 'set-dns-servestale', noCache);
+    setDisabled('row-dns-servettl', 'set-dns-servettl', noStale);
+    setDisabled('row-dns-disablefallbackifmatch', 'set-dns-disablefallbackifmatch', on('set-dns-disablefallback'));
+}
+
+function syncQueryStrategyHint() {
+    const select = document.getElementById('set-query-strategy');
+    const hint = document.getElementById('query-strategy-hint');
+    if (!select || !hint) return;
+    const key = DNS_QUERY_STRATEGY_HINT_KEYS[select.value] || DNS_QUERY_STRATEGY_HINT_KEYS.UseIPv4;
+    hint.setAttribute('data-i18n', key); // so a language switch re-translates it
+    hint.innerHTML = t(key);
+}
+
+function bindSettingsToFormView() {
+    migrateDnsSettings();
+    currentLang = resolveLanguage();
+    applyI18n();
+
+    document.getElementById('set-loglevel').value = advSettings.loglevel || "none";
+    document.getElementById('set-sniffing').checked = advSettings.sniffing;
+    document.getElementById('set-routeonly').checked = advSettings.routeOnly;
+    document.getElementById('set-enableipv6').checked = advSettings.enableIPv6;
+    document.getElementById('set-enableipv6ula').checked = advSettings.enableIPv6ULA === true;
+    toggleSubSettingField('set-enableipv6', 'enableipv6ula-sub-fields');
+    // Migrate the legacy boolean `preferIpv6` into `queryStrategy` once.
+    advSettings.queryStrategy = resolveDnsQueryStrategy(advSettings);
+    delete advSettings.preferIpv6;
+    document.getElementById('set-query-strategy').value = advSettings.queryStrategy;
+    syncQueryStrategyHint();
+    // `x || true` is always true — the checkbox could never render unchecked
+    // even though the value was being persisted correctly.
+    document.getElementById('set-dnsviaproxy').checked = advSettings.dnsViaProxy !== false;
+    // Default ON: settings saved by older versions have no value.
+    document.getElementById('set-hijackdns').checked = advSettings.hijackDns === true;
+    document.getElementById('set-pinned-cert').value = advSettings.pinnedPeerCertSha256 || "";
+
+    // DNS engine options
+    document.getElementById('set-dns-disablecache').checked = advSettings.dnsDisableCache === true;
+    document.getElementById('set-dns-servestale').checked = advSettings.dnsServeStale === true;
+    document.getElementById('set-dns-servettl').value = Math.max(0, parseInt(advSettings.dnsServeExpiredTTL, 10) || 0);
+    document.getElementById('set-dns-disablefallback').checked = advSettings.dnsDisableFallback === true;
+    document.getElementById('set-dns-disablefallbackifmatch').checked = advSettings.dnsDisableFallbackIfMatch === true;
+    // Default ON: settings saved by older versions have no value.
+    document.getElementById('set-dns-parallel').checked = advSettings.dnsParallelQuery !== false;
+    document.getElementById('set-dns-systemhosts').checked = advSettings.dnsUseSystemHosts === true;
+    syncDnsEngineOptions();
+
+    // DNS group
+    document.getElementById('set-localdns').checked = advSettings.localDns || false;
+    document.getElementById('set-fakedns-local').checked = advSettings.fakeDnsLocal || false;
+    updateDnsSummary();
+    updateDnsGroupVisibility();
+    
+    document.getElementById('set-mux').checked = advSettings.mux;
+    document.getElementById('set-mux-connections').value = advSettings.mux_connections;
+    toggleSubSettingField('set-mux', 'mux-sub-fields');
+
+    document.getElementById('set-fragment').checked = advSettings.fragment;
+    document.getElementById('set-fragment-packets').value = advSettings.fragment_packets || "tlshello";
+    document.getElementById('set-fragment-length').value = advSettings.fragment_length || "50-100";
+    document.getElementById('set-fragment-interval').value = advSettings.fragment_interval || "10-20";
+    toggleSubSettingField('set-fragment', 'fragment-sub-fields');
+
+    document.getElementById('set-mtu').value = advSettings.mtu || 1350;
+    document.getElementById('set-networkmode').value = advSettings.networkMode ?? 0;
+    refreshUpstreamIfaceOptions(advSettings.upstreamIface);
+    document.getElementById('set-allowtether').checked = advSettings.allowTether !== false;
+    document.getElementById('set-bypassvpn').checked = advSettings.bypassVpnService !== false;
+    migrateLanBypassSetting();
+    renderLanBypassList();
+
+    if (!Array.isArray(advSettings.routingRules)) advSettings.routingRules = [];
+    renderRoutingRules();
+    syncDomainStrategyForm();
+
+    syncBypassIfaceState();
+    bindProModeToFormView();
+}
+
+function saveAdvancedSettingsForm(isLangOnly = false) {    advSettings.loglevel = document.getElementById('set-loglevel').value;
+    advSettings.sniffing = document.getElementById('set-sniffing').checked;
+    advSettings.routeOnly = document.getElementById('set-routeonly').checked;
+    {
+        const qs = document.getElementById('set-query-strategy').value;
+        advSettings.queryStrategy = DNS_QUERY_STRATEGIES.includes(qs) ? qs : "UseIPv4";
+        delete advSettings.preferIpv6;
+    }
+    advSettings.dnsViaProxy = document.getElementById('set-dnsviaproxy').checked;
+    advSettings.hijackDns = document.getElementById('set-hijackdns').checked;
+    advSettings.pinnedPeerCertSha256 = document.getElementById('set-pinned-cert').value.trim();
+
+    // DNS engine options
+    advSettings.dnsDisableCache = document.getElementById('set-dns-disablecache').checked;
+    advSettings.dnsServeStale = document.getElementById('set-dns-servestale').checked;
+    advSettings.dnsServeExpiredTTL = Math.max(0, parseInt(document.getElementById('set-dns-servettl').value, 10) || 0);
+    advSettings.dnsDisableFallback = document.getElementById('set-dns-disablefallback').checked;
+    advSettings.dnsDisableFallbackIfMatch = document.getElementById('set-dns-disablefallbackifmatch').checked;
+    advSettings.dnsParallelQuery = document.getElementById('set-dns-parallel').checked;
+    advSettings.dnsUseSystemHosts = document.getElementById('set-dns-systemhosts').checked;
+
+    // DNS group
+    advSettings.localDns = document.getElementById('set-localdns').checked;
+    advSettings.fakeDnsLocal = document.getElementById('set-fakedns-local').checked;
+    delete advSettings.vpnDns; // removed setting: drop leftovers from older saved configs
+    // The three DNS lists are edited in the DNS servers modal (saveDnsModal)
+    // and already live on advSettings.
+
+    advSettings.mux = document.getElementById('set-mux').checked;
+    advSettings.mux_connections = parseInt(document.getElementById('set-mux-connections').value) || 8;
+
+    advSettings.fragment = document.getElementById('set-fragment').checked;
+    advSettings.fragment_packets = document.getElementById('set-fragment-packets').value;
+    advSettings.fragment_length = document.getElementById('set-fragment-length').value || "50-100";
+    advSettings.fragment_interval = document.getElementById('set-fragment-interval').value || "10-20";
+
+    advSettings.mtu = parseInt(document.getElementById('set-mtu').value) || 1350;
+
+    // advSettings.lang is only written by changeLanguage() (explicit choice);
+    // persisting currentLang here would turn auto-detection into a fixed choice.
+
+    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+        if (isLangOnly) return;
+        showToast(t('toast_settings_saved'), "success");
+        // Nothing on this form is read by apply_routing_rules, so the
+        // default soft reload is enough: swap the xray process, leave the
+        // iptables/policy routing rules as they are. The OS-level switches
+        // (apply-on mode, IPv6, tether, bypass interfaces) live on the
+        // Network tab and are saved by saveNetworkSettingsForm() below.
+        applyActiveConfig();
+    });
+}
+
+// Traffic Settings tab: restore every field it owns (TRAFFIC_SETTING_KEYS in
+// vars.js) to its default, then save and apply like the Save button does.
+// Other tabs' settings are left alone.
+async function resetTrafficSettings() {
+    const ok = await showConfirm(t('confirm_reset_traffic'));
+    if (!ok) return;
+    TRAFFIC_SETTING_KEYS.forEach(k => { advSettings[k] = TRAFFIC_SETTINGS_DEFAULTS[k]; });
+    delete advSettings.preferIpv6;
+    bindSettingsToFormView();
+    saveAdvancedSettingsForm();
+}
+
+// Network tab: the switches apply_routing_rules reads directly (apply-on
+// mode, IPv6, tether, LAN, bypass interfaces). Unlike a node switch or an Xray-level
+// routing-rule edit, changing them requires the iptables rules to be torn
+// down and rebuilt, so this always forces the full restart.
+// Only touches its own fields on advSettings; everything else already lives
+// in memory from the last load/save of the Traffic form.
+function saveNetworkSettingsForm() {
+    advSettings.networkMode = parseInt(document.getElementById('set-networkmode').value) || 0;
+    advSettings.upstreamIface = sanitizeUpstreamIface(document.getElementById('set-upstreamiface').value);
+    advSettings.enableIPv6 = document.getElementById('set-enableipv6').checked;
+    advSettings.enableIPv6ULA = document.getElementById('set-enableipv6ula').checked;
+    advSettings.allowTether = document.getElementById('set-allowtether').checked;
+    advSettings.bypassVpnService = document.getElementById('set-bypassvpn').checked;
+    advSettings.lanProxyCidrs = collectLanProxyCidrs();
+    delete advSettings.includeLan;
+
+    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+        applyBypassIfaceForm(() => {
+            showToast(t('toast_settings_saved'), "success");
+            applyActiveConfig({ force: true });
+        });
+    });
+}
+
+// ===== Upstream network interface =====
+// advSettings.upstreamIface: "auto" (default) or an interface name. Read by
+// service.sh (query_settings upstreamIface), which pins Xray's own egress
+// (fwmark 255) to that interface's routing table. IFNAMSIZ is 16 incl. NUL,
+// so a name is at most 15 chars; the charset matches service.sh's check.
+function sanitizeUpstreamIface(raw) {
+    const v = String(raw || '').trim();
+    if (!v || v.toLowerCase() === 'auto') return 'auto';
+    return /^[A-Za-z0-9_.-]{1,15}$/.test(v) ? v : 'auto';
+}
+
+// Fills the dropdown with "Auto" plus the interfaces currently present.
+// A saved name that is not up right now is still listed (marked) so opening
+// the tab never silently rewrites the user's choice to "auto".
+function refreshUpstreamIfaceOptions(selected) {
+    const sel = document.getElementById('set-upstreamiface');
+    if (!sel) return;
+    const want = sanitizeUpstreamIface(selected);
+    const build = (names) => {
+        const present = new Set(names);
+        sel.innerHTML = '';
+        const auto = document.createElement('option');
+        auto.value = 'auto';
+        auto.textContent = t('upstream_iface_auto');
+        sel.appendChild(auto);
+        const list = names.slice();
+        if (want !== 'auto' && !present.has(want)) list.push(want);
+        list.forEach(name => {
+            const o = document.createElement('option');
+            o.value = name;
+            o.textContent = present.has(name) ? name : t('upstream_iface_missing', { name });
+            sel.appendChild(o);
+        });
+        sel.value = want;
+    };
+    // Loopback, our own tun and tunnel/dummy pseudo-devices are never a
+    // sensible upstream; everything else in /sys/class/net is offered.
+    execShell(
+        `for i in /sys/class/net/*; do n=\${i##*/}; case "$n" in lo|${TUN_NAME_UI}|dummy*|ifb*|sit*|ip6tnl*|ip_vti*|ip6_vti*|ip6gre*|gre*|erspan*|bond*|tunl*) continue ;; esac; echo "$n"; done`,
+        (out) => {
+            const names = (out && out !== 'ERROR' ? out : '')
+                .split('\n').map(x => x.trim())
+                .filter(x => /^[A-Za-z0-9_.-]{1,15}$/.test(x));
+            build(names);
+        }
+    );
+}
+
+// ===== Bypass LAN =====
+// One switch per range of LAN_BYPASS_CIDRS (vars.js). Ticked = the range skips
+// Xray (the default for all of them); unticked = it is sent into Xray.
+// Persisted in settings.base64 as `lanProxyCidrs`: the space-separated list of
+// UNticked CIDRs (no commas, which service.sh's query_settings cannot parse).
+// Storing the unticked ones keeps "everything bypassed" as the default, also
+// for ranges added in a later version. service.sh re-reads it on every apply.
+
+// Older versions had one boolean `includeLan` (true = send all LAN ranges
+// except loopback through Xray). Converts it once; the old key is dropped on
+// the next save.
+function migrateLanBypassSetting() {
+    if (typeof advSettings.lanProxyCidrs !== 'string') {
+        advSettings.lanProxyCidrs = advSettings.includeLan === true
+            ? LAN_BYPASS_CIDRS.map(e => e.cidr).join(' ')
+            : '';
+    }
+    delete advSettings.includeLan;
+}
+
+function renderLanBypassList() {
+    const box = document.getElementById('lan-bypass-list');
+    if (!box) return;
+    const unticked = new Set(String(advSettings.lanProxyCidrs || '').split(/\s+/).filter(Boolean));
+    let html = '';
+    [4, 6].forEach(v => {
+        html += `<div class="lan-family-title" data-i18n="lan_family_v${v}">IPv${v}</div>`;
+        LAN_BYPASS_CIDRS.filter(e => e.v === v).forEach(e => {
+            const id = 'lan-cidr-' + e.cidr.replace(/[^0-9a-z]/gi, '_');
+            const checked = !unticked.has(e.cidr);
+            html += `<div class="setting-item-row toggle-row">` +
+                `<label for="${id}"><span class="lan-cidr-code">${e.cidr}</span><small>${e.name}</small></label>` +
+                `<input type="checkbox" id="${id}" data-cidr="${e.cidr}"` +
+                `${checked ? ' checked' : ''} onchange="updateLanBypassSummary()">` +
+                `</div>`;
+        });
+    });
+    box.innerHTML = html;
+    applyI18n();
+    updateLanBypassSummary();
+}
+
+// Ticks/unticks every listed range (loopback is not listed, always bypassed).
+function setLanBypassAll(on) {
+    document.querySelectorAll('#lan-bypass-list input[data-cidr]').forEach(el => {
+        el.checked = on;
+    });
+    updateLanBypassSummary();
+}
+
+function updateLanBypassSummary() {
+    const el = document.getElementById('lan-bypass-summary');
+    if (!el) return;
+    const boxes = document.querySelectorAll('#lan-bypass-list input[data-cidr]');
+    const on = Array.from(boxes).filter(b => b.checked).length;
+    el.textContent = t('lan_bypass_summary', { on, total: boxes.length });
+}
+
+// The value to store in advSettings.lanProxyCidrs: every unticked range.
+function collectLanProxyCidrs() {
+    return Array.from(document.querySelectorAll('#lan-bypass-list input[data-cidr]'))
+        .filter(el => !el.checked)
+        .map(el => el.dataset.cidr)
+        .join(' ');
+}
+
+// ===== Bypass network interface =====
+// Stored as a standalone file (BYPASS_IFACE_FILE) rather than inside
+// settings.base64 — same pattern as the Mobile IP Hunter panel: file
+// existence means the feature is enabled, and its content is the
+// comma-separated interface list, re-read live by service.sh on apply.
+//
+// Unlike the IP Hunter panel, this one does NOT write on every toggle/input
+// change. The checkbox only shows/hides the sub-fields (toggleSubSettingField),
+// and the list field is plain text — nothing is persisted to disk until the
+// user presses "Save & Restart Engine" on the Network tab, which calls
+// applyBypassIfaceForm() below as part of saveNetworkSettingsForm().
+
+function syncBypassIfaceState() {
+    execShell(
+        `if [ -f ${shQuote(BYPASS_IFACE_FILE)} ]; then echo 1; cat ${shQuote(BYPASS_IFACE_FILE)}; else echo 0; fi`,
+        (output) => {
+            const toggle = document.getElementById('set-bypassiface');
+            const input = document.getElementById('set-bypassiface-list');
+            const lines = (output || '').split('\n');
+            const fileEnabled = lines[0].trim() === '1';
+            // The VpnService pattern is managed by its own switch; keep it out
+            // of the user-visible list.
+            const userList = sanitizeBypassIfaceList(lines.slice(1).join('\n'))
+                .split(',').filter(x => x && x !== VPN_IFACE_PATTERN).join(',');
+            const enabled = fileEnabled && !!userList;
+
+            if (toggle) toggle.checked = enabled;
+            if (input) input.value = userList || "tailscale0,wt0";
+            toggleSubSettingField('set-bypassiface', 'bypassiface-sub-fields');
+        }
+    );
+}
+
+function sanitizeBypassIfaceList(raw) {
+    return (raw || '')
+        .split(/[,\s]+/)
+        .map(p => p.trim())
+        .filter(Boolean)
+        .join(',');
+}
+
+// Persists the current state of the bypass-interface form to disk. Called
+// only from saveNetworkSettingsForm() (the Network tab's save button), not
+// on every checkbox/input change.
+function applyBypassIfaceForm(callback) {
+    const toggle = document.getElementById('set-bypassiface');
+    const input = document.getElementById('set-bypassiface-list');
+    const vpnBypass = !!document.getElementById('set-bypassvpn')?.checked;
+    const done = callback || (() => {});
+
+    let list = [];
+    if (toggle?.checked) {
+        const sanitized = sanitizeBypassIfaceList(input?.value || '') || "tailscale0,wt0";
+        if (input) input.value = sanitized;
+        list = sanitized.split(',').filter(x => x && x !== VPN_IFACE_PATTERN);
+    }
+    if (vpnBypass) list.push(VPN_IFACE_PATTERN);
+
+    if (!list.length) {
+        execShell(`rm -f ${shQuote(BYPASS_IFACE_FILE)}`, done);
+        return;
+    }
+
+    execShell(`mkdir -p ${shQuote(DATADIR)} && chmod 700 ${shQuote(DATADIR)}`, () => {
+        writeFileB64(BYPASS_IFACE_FILE, list.join(','), done);
+    });
+}
+
+// ===== Routing Settings tab =====
+
+function _summarizeRoutingRule(rule) {
+    const parts = [];
+    if (rule.domain && rule.domain.trim()) parts.push(`domain: ${rule.domain.trim()}`);
+    if (rule.ip && rule.ip.trim()) parts.push(`ip: ${rule.ip.trim()}`);
+    if (rule.port && String(rule.port).trim()) parts.push(`port: ${String(rule.port).trim()}`);
+    if (rule.protocol && rule.protocol.trim()) parts.push(`protocol: [${rule.protocol.trim()}]`);
+    if (rule.network && rule.network.trim()) parts.push(`network: [${rule.network.trim()}]`);
+    return parts.join('  ·  ') || t('rule_no_conditions');
+}
+
+function renderRoutingRules() {
+    const container = document.getElementById('routing-rules-container');
+    const emptyState = document.getElementById('routing-empty-state');
+    if (!container) return;
+
+    const rules = Array.isArray(advSettings.routingRules) ? advSettings.routingRules : [];
+    container.innerHTML = '';
+
+    if (rules.length === 0) {
+        if (emptyState) emptyState.style.display = 'block';
+        return;
+    }
+    if (emptyState) emptyState.style.display = 'none';
+
+    rules.forEach((rule, index) => {
+        const row = document.createElement('div');
+        row.className = `routing-rule-row${rule.enabled === false ? ' rule-disabled' : ''}`;
+
+        // Rule order is match priority in Xray (first match wins), so the
+        // list can be reordered. Up/down buttons rather than drag & drop:
+        // HTML5 drag events do not fire on touch in the Android WebView.
+        const reorder = document.createElement('div');
+        reorder.className = 'routing-rule-reorder';
+        const upBtn = document.createElement('button');
+        upBtn.className = 'routing-rule-icon-btn';
+        upBtn.title = t('btn_move_up');
+        upBtn.disabled = index === 0;
+        upBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>';
+        upBtn.onclick = (e) => { e.stopPropagation(); moveRoutingRule(index, -1); };
+        reorder.appendChild(upBtn);
+        const downBtn = document.createElement('button');
+        downBtn.className = 'routing-rule-icon-btn';
+        downBtn.title = t('btn_move_down');
+        downBtn.disabled = index === rules.length - 1;
+        downBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+        downBtn.onclick = (e) => { e.stopPropagation(); moveRoutingRule(index, 1); };
+        reorder.appendChild(downBtn);
+        row.appendChild(reorder);
+
+        const info = document.createElement('div');
+        info.className = 'routing-rule-info';
+        info.onclick = () => editRoutingRule(index);
+
+        const name = document.createElement('div');
+        name.className = 'routing-rule-name';
+        name.textContent = (rule.remarks && rule.remarks.trim()) || t('rule_untitled');
+        info.appendChild(name);
+
+        const meta = document.createElement('div');
+        meta.className = 'routing-rule-meta';
+        meta.textContent = _summarizeRoutingRule(rule);
+        info.appendChild(meta);
+
+        const badge = document.createElement('span');
+        const tag = rule.outboundTag || 'proxy';
+        let badgeText = tag;
+        if (ROUTING_BUILTIN_TAGS_UI.includes(tag)) {
+            badge.className = `routing-rule-outbound-badge tag-${tag}`;
+        } else if (tag.indexOf(POLICY_GROUP_PREFIX) === 0) {
+            const g = _findPolicyGroup(tag.slice(POLICY_GROUP_PREFIX.length));
+            badge.className = `routing-rule-outbound-badge tag-group${g ? '' : ' tag-missing'}`;
+            badgeText = g ? g.name : t('opt_outbound_group_missing');
+        } else {
+            // Saved-node remark: free text, so never put it into the class name.
+            const exists = !!_findNodeByRemark(tag);
+            badge.className = `routing-rule-outbound-badge tag-node${exists ? '' : ' tag-missing'}`;
+            if (!exists) badge.title = t('opt_outbound_node_missing', { name: tag });
+        }
+        badge.textContent = badgeText;
+        info.appendChild(badge);
+
+        row.appendChild(info);
+
+        const actions = document.createElement('div');
+        actions.className = 'routing-rule-actions';
+
+        const editBtn = document.createElement('button');
+        editBtn.className = 'routing-rule-icon-btn';
+        editBtn.title = t('menu_edit');
+        editBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
+        editBtn.onclick = (e) => { e.stopPropagation(); editRoutingRule(index); };
+        actions.appendChild(editBtn);
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'routing-rule-icon-btn btn-delete-item';
+        delBtn.title = t('btn_delete');
+        delBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+        delBtn.onclick = (e) => { e.stopPropagation(); deleteRoutingRule(index); };
+        actions.appendChild(delBtn);
+
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.checked = rule.enabled !== false;
+        toggle.onchange = () => toggleRoutingRuleEnabled(index);
+        actions.appendChild(toggle);
+
+        row.appendChild(actions);
+        container.appendChild(row);
+    });
+}
+
+// Swaps a rule with its neighbour. The list re-renders immediately, but the
+// save (which regenerates config.json and reloads xray) is debounced so a
+// run of clicks moving one rule several places costs a single reload.
+function moveRoutingRule(index, delta) {
+    const rules = advSettings.routingRules;
+    const target = index + delta;
+    if (!Array.isArray(rules) || !rules[index] || target < 0 || target >= rules.length) return;
+    [rules[index], rules[target]] = [rules[target], rules[index]];
+    renderRoutingRules();
+
+    const rows = document.querySelectorAll('#routing-rules-container .routing-rule-row');
+    if (rows[target]) rows[target].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+    clearTimeout(_routingPersistTimer);
+    _routingPersistTimer = setTimeout(persistRoutingRules, 800);
+}
+
+// Rebuilds the outboundTag <select>: built-ins first, then every saved node
+// (grouped by category) by remark. If the rule's current target is a node that
+// has since been deleted/renamed it stays selectable and is flagged, so
+// editing the rule never silently rewrites it to "proxy".
+function _populateRuleOutboundSelect(selected) {
+    const sel = document.getElementById('rule-outbound');
+    if (!sel) return;
+    sel.innerHTML = '';
+
+    const addOpt = (parent, value, text) => {
+        const o = document.createElement('option');
+        o.value = value;
+        o.textContent = text;
+        parent.appendChild(o);
+    };
+
+    addOpt(sel, 'proxy', t('opt_outbound_proxy'));
+    addOpt(sel, 'direct', t('opt_outbound_direct'));
+    addOpt(sel, 'block', t('opt_outbound_block'));
+
+    const seen = new Set(ROUTING_BUILTIN_TAGS_UI);
+    Object.keys(profiles).forEach(category => {
+        const nodes = (profiles[category]?.nodes || []).filter(n => {
+            const r = _nodeRemark(n);
+            if (!r || seen.has(r)) return false; // built-ins win; first remark wins
+            seen.add(r);
+            return true;
+        });
+        if (!nodes.length) return;
+        const group = document.createElement('optgroup');
+        group.label = category;
+        nodes.forEach(n => addOpt(group, _nodeRemark(n), _nodeRemark(n)));
+        sel.appendChild(group);
+    });
+
+    const groups = _allPolicyGroups();
+    if (groups.length) {
+        const og = document.createElement('optgroup');
+        og.label = t('opt_outbound_group_label');
+        groups.forEach(g => addOpt(og, POLICY_GROUP_PREFIX + g.id, g.name));
+        sel.appendChild(og);
+    }
+
+    if (selected && selected.indexOf(POLICY_GROUP_PREFIX) === 0) {
+        if (!groups.some(g => POLICY_GROUP_PREFIX + g.id === selected)) {
+            addOpt(sel, selected, t('opt_outbound_group_missing'));
+        }
+    } else if (selected && !seen.has(selected)) {
+        addOpt(sel, selected, t('opt_outbound_node_missing', { name: selected }));
+    }
+    sel.value = selected || 'proxy';
+}
+
+function openAddRoutingRuleModal() {
+    currentEditingRuleIndex = null;
+    document.getElementById('routing-rule-modal-title').setAttribute('data-i18n', 'modal_add_rule_title');
+    document.getElementById('routing-rule-modal-title').innerHTML = t('modal_add_rule_title');
+    document.getElementById('rule-remarks').value = '';
+    document.getElementById('rule-locked').checked = false;
+    document.getElementById('rule-domain').value = '';
+    document.getElementById('rule-ip').value = '';
+    document.getElementById('rule-port').value = '';
+    document.getElementById('rule-protocol').value = '';
+    document.getElementById('rule-network').value = '';
+    _populateRuleOutboundSelect('proxy');
+    document.getElementById('routing-rule-modal').style.display = 'block';
+}
+
+function editRoutingRule(index) {
+    const rule = advSettings.routingRules[index];
+    if (!rule) return;
+    currentEditingRuleIndex = index;
+    document.getElementById('routing-rule-modal-title').setAttribute('data-i18n', 'modal_edit_rule_title');
+    document.getElementById('routing-rule-modal-title').innerHTML = t('modal_edit_rule_title');
+    document.getElementById('rule-remarks').value = rule.remarks || '';
+    document.getElementById('rule-locked').checked = !!rule.locked;
+    document.getElementById('rule-domain').value = rule.domain || '';
+    document.getElementById('rule-ip').value = rule.ip || '';
+    document.getElementById('rule-port').value = rule.port || '';
+    document.getElementById('rule-protocol').value = rule.protocol || '';
+    document.getElementById('rule-network').value = rule.network || '';
+    _populateRuleOutboundSelect(rule.outboundTag || 'proxy');
+    document.getElementById('routing-rule-modal').style.display = 'block';
+}
+
+function closeRoutingRuleModal() {
+    document.getElementById('routing-rule-modal').style.display = 'none';
+    currentEditingRuleIndex = null;
+}
+
+function saveRoutingRule() {
+    const domain = document.getElementById('rule-domain').value.trim();
+    const ip = document.getElementById('rule-ip').value.trim();
+    const port = document.getElementById('rule-port').value.trim();
+    const protocol = document.getElementById('rule-protocol').value.trim();
+
+    if (!domain && !ip && !port && !protocol) {
+        showToast(t('toast_rule_needs_condition'), 'error');
+        return;
+    }
+
+    const rule = {
+        remarks: document.getElementById('rule-remarks').value.trim(),
+        locked: document.getElementById('rule-locked').checked,
+        domain,
+        ip,
+        port,
+        protocol,
+        network: document.getElementById('rule-network').value,
+        outboundTag: document.getElementById('rule-outbound').value,
+        enabled: currentEditingRuleIndex !== null ? (advSettings.routingRules[currentEditingRuleIndex].enabled !== false) : true
+    };
+
+    if (!Array.isArray(advSettings.routingRules)) advSettings.routingRules = [];
+
+    if (currentEditingRuleIndex === null) {
+        advSettings.routingRules.push(rule);
+    } else {
+        advSettings.routingRules[currentEditingRuleIndex] = rule;
+    }
+
+    closeRoutingRuleModal();
+    renderRoutingRules();
+    persistRoutingRules();
+    showToast(t('toast_rule_saved'), 'success');
+}
+
+function toggleRoutingRuleEnabled(index) {
+    const rule = advSettings.routingRules[index];
+    if (!rule) return;
+    rule.enabled = rule.enabled === false; // flip: was disabled -> enable, else disable
+    renderRoutingRules();
+    persistRoutingRules();
+}
+
+async function deleteRoutingRule(index) {
+    if (!advSettings.routingRules[index]) return;
+    const ok = await showConfirm(t('confirm_delete_rule'));
+    if (!ok) return;
+    advSettings.routingRules.splice(index, 1);
+    renderRoutingRules();
+    persistRoutingRules();
+    showToast(t('toast_rule_deleted'), 'success');
+}
+
+// ===== Routing domainStrategy =====
+// Same save-on-change behavior as the rule list below: the setting goes to
+// disk and the active config is regenerated (soft reload, no iptables
+// rebuild — routing.domainStrategy is Xray-internal).
+const DOMAIN_STRATEGY_VALUES = ['AsIs', 'IPIfNonMatch', 'IPOnDemand'];
+const DOMAIN_STRATEGY_HINT_KEYS = {
+    AsIs: 'hint_ds_asis',
+    IPIfNonMatch: 'hint_ds_ifnonmatch',
+    IPOnDemand: 'hint_ds_ondemand'
+};
+
+function _currentDomainStrategy() {
+    return DOMAIN_STRATEGY_VALUES.includes(advSettings.domainStrategy) ? advSettings.domainStrategy : 'AsIs';
+}
+
+function syncDomainStrategyForm() {
+    const select = document.getElementById('set-domain-strategy');
+    const value = _currentDomainStrategy();
+    if (select) select.value = value;
+    const hint = document.getElementById('domain-strategy-hint');
+    if (hint) {
+        const key = DOMAIN_STRATEGY_HINT_KEYS[value];
+        hint.setAttribute('data-i18n', key); // so a language switch re-translates it
+        hint.innerHTML = t(key);
+    }
+}
+
+function onDomainStrategyChange(select) {
+    const value = DOMAIN_STRATEGY_VALUES.includes(select.value) ? select.value : 'AsIs';
+    advSettings.domainStrategy = value;
+    syncDomainStrategyForm();
+    persistRoutingRules();
+}
+
+// Persists advSettings (including routingRules) to disk and, if a proxy is
+// currently active, regenerates its Xray config and restarts if running.
+function persistRoutingRules() {
+    // Any pending debounced save from moveRoutingRule() is covered by this one.
+    clearTimeout(_routingPersistTimer);
+    writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {
+        applyActiveConfig();
+    });
+}
+
+// Restores the built-in routing rule list. Replaces every rule, locked ones
+// included (a deliberate reset, unlike a preset import which keeps locked
+// rules). domainStrategy is a separate setting and is left alone.
+async function resetRoutingRulesToDefault() {
+    const ok = await showConfirm(t('confirm_reset_rules'));
+    if (!ok) return;
+    advSettings.routingRules = JSON.parse(ROUTING_RULES_DEFAULTS_JSON);
+    renderRoutingRules();
+    persistRoutingRules();
+    showToast(t('toast_rules_reset'), 'success');
+}
+
+// ===== Import / Export Routing Presets (JSON) =====
+
+function _rtSplitCsv(v) {
+    return (typeof v === 'string' ? v : '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+}
+
+function _rtToCsv(v) {
+    if (Array.isArray(v)) return v.map(s => String(s).trim()).filter(Boolean).join(',');
+    return typeof v === 'string' ? v : '';
+}
+
+function openImportRoutingModal() {
+    document.getElementById('import-routing-textarea').value = '';
+    const urlInput = document.getElementById('import-routing-url');
+    if (urlInput) urlInput.value = '';
+    document.getElementById('import-routing-modal').style.display = 'block';
+}
+
+function closeImportRoutingModal() {
+    document.getElementById('import-routing-modal').style.display = 'none';
+}
+
+// Fetches a routing preset JSON array from a URL (same curl path used for
+// subscriptions, including the local SOCKS5 hop when the proxy is running so
+// the fetch itself doesn't leak outside the tunnel) and drops the raw result
+// into the textarea for review before the user confirms the import.
+async function fetchRoutingPresetFromUrl() {
+    const urlInput = document.getElementById('import-routing-url');
+    const url = (urlInput?.value || '').trim();
+    if (!url) return showToast(t('toast_empty_import'), 'error');
+
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        return showToast(t('toast_invalid_sub'), 'error');
+    }
+
+    const status = await execShellAsync(`sh ${MODDIR}/proxy_control.sh status`);
+    const viaProxy = (status === 'running') ? "--socks5-hostname 127.17.1.3:808" : "";
+
+    // Certificate validation is ON by default, matching fetchSubscription().
+    // Routing presets reach a root shell just like subscription bodies do,
+    // so the same TLS and shell-quoting hardening applies here.
+    const cmd = `${MODDIR}/bin/curl ${viaProxy} -sSL -f --max-redirs 3 ` +
+                `--proto '=http,https' --proto-redir '=http,https' ` +
+                `--max-time 15 ${shQuote(url)}`;
+
+    await asyncShowLoading('toast_fetch_sub');
+    execShell(cmd, (res) => {
+        hideLoading();
+        if (!res || res.trim() === "") {
+            return showToast(t('toast_fetch_failed'), 'error');
+        }
+        if (res.includes("Failed to connect") || res.includes("Could not resolve")) {
+            return showToast(t('toast_fetch_reason') + res.split('\n')[0], 'error');
+        }
+
+        try {
+            const parsed = JSON.parse(res.trim());
+            if (!Array.isArray(parsed)) throw new Error('not an array');
+            document.getElementById('import-routing-textarea').value = JSON.stringify(parsed, null, 2);
+            showToast(t('toast_rules_fetch_ok'), 'success');
+        } catch (e) {
+            showToast(t('toast_rules_import_invalid'), 'error');
+        }
+    });
+}
+
+function importRoutingRulesFromJson() {
+    const raw = document.getElementById('import-routing-textarea').value.trim();
+    if (!raw) return;
+
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (e) {
+        showToast(t('toast_rules_import_invalid'), 'error');
+        return;
+    }
+
+    if (!Array.isArray(parsed)) {
+        showToast(t('toast_rules_import_invalid'), 'error');
+        return;
+    }
+
+    const imported = parsed.map(raw => ({
+        remarks: raw.remarks || '',
+        locked: !!raw.locked,
+        domain: _rtToCsv(raw.domain),
+        ip: _rtToCsv(raw.ip),
+        port: raw.port !== undefined && raw.port !== null ? String(raw.port) : '',
+        protocol: _rtToCsv(raw.protocol),
+        network: raw.network || '',
+        outboundTag: String(raw.outboundTag || 'proxy'),
+        enabled: raw.enabled !== false
+    }));
+
+    if (!Array.isArray(advSettings.routingRules)) advSettings.routingRules = [];
+    // Presets replace unlocked rules; locked rules are preserved as-is.
+    const keptLocked = advSettings.routingRules.filter(r => r.locked);
+    advSettings.routingRules = keptLocked.concat(imported);
+
+    closeImportRoutingModal();
+    renderRoutingRules();
+    persistRoutingRules();
+    showToast(t('toast_rules_imported'), 'success');
+}
+
+function exportRoutingRulesToClipboard() {
+    const rules = Array.isArray(advSettings.routingRules) ? advSettings.routingRules : [];
+    const exportArr = rules.map(rule => {
+        const obj = {};
+        if (rule.remarks) obj.remarks = rule.remarks;
+        obj.enabled = rule.enabled !== false;
+        obj.locked = !!rule.locked;
+
+        const domain = _rtSplitCsv(rule.domain);
+        if (domain.length) obj.domain = domain;
+        const ip = _rtSplitCsv(rule.ip);
+        if (ip.length) obj.ip = ip;
+        if (rule.port && String(rule.port).trim()) obj.port = String(rule.port).trim();
+        const protocol = _rtSplitCsv(rule.protocol);
+        if (protocol.length) obj.protocol = protocol;
+        if (rule.network && String(rule.network).trim()) obj.network = rule.network.trim();
+
+        obj.outboundTag = rule.outboundTag || 'proxy';
+        return obj;
+    });
+
+    const jsonStr = JSON.stringify(exportArr);
+    navigator.clipboard.writeText(jsonStr).then(() => {
+        showToast(t('toast_rules_exported'), 'success');
+    }).catch(() => {
+        showToast(t('toast_rules_export_fail'), 'error');
+    });
+}
+
+// Promise-based confirm dialog backed by a DOM modal — KSU webui does not
+// support window.confirm()/window.alert(). Usage: if (await showConfirm(msg)) { ... }
+function showConfirm(message, options = {}) {
+    return new Promise(resolve => {
+        const overlay = document.getElementById('confirm-modal-overlay');
+        const okBtn = document.getElementById('confirm-modal-ok');
+        const cancelBtn = document.getElementById('confirm-modal-cancel');
+        if (!overlay || !okBtn || !cancelBtn) {
+            // Fallback should the modal markup ever be missing.
+            resolve(true);
+            return;
+        }
+
+        document.getElementById('confirm-modal-message').textContent = message;
+        okBtn.textContent = options.okText || t('confirm_ok');
+        cancelBtn.textContent = options.cancelText || t('confirm_cancel');
+        overlay.style.display = 'flex';
+
+        const cleanup = (result) => {
+            overlay.style.display = 'none';
+            okBtn.onclick = null;
+            cancelBtn.onclick = null;
+            resolve(result);
+        };
+        okBtn.onclick = () => cleanup(true);
+        cancelBtn.onclick = () => cleanup(false);
+    });
+}
+
+function showToast(message, type = 'success') {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast-item toast-${type}`;
+    toast.innerText = message;
+
+    container.appendChild(toast);
+
+    setTimeout(() => {
+        toast.classList.add('show');
+    }, 10);
+
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => {
+            toast.remove();
+        }, 300);
+    }, 3000);
+}
+
+// Probe slots. Only NODE_TEST_CONCURRENCY probes run at once, so a small pool
+// of listen address/port pairs is enough and — unlike the old
+// `index % 250` scheme — cannot collide once a category exceeds 250 nodes.
+const NODE_TEST_CONCURRENCY = 10;
+const NODE_TEST_SLOTS = 16;
+const _nodeTestSlotBusy = new Array(NODE_TEST_SLOTS).fill(false);
+
+function _acquireTestSlot() {
+    for (let i = 0; i < NODE_TEST_SLOTS; i++) {
+        if (!_nodeTestSlotBusy[i]) { _nodeTestSlotBusy[i] = true; return i; }
+    }
+    return -1;
+}
+
+function _releaseTestSlot(slot) {
+    if (slot >= 0 && slot < NODE_TEST_SLOTS) _nodeTestSlotBusy[slot] = false;
+}
+
+function _buildXrayTestInbound(node, slot) {
+    const testIp = `127.17.1.${10 + slot}`;
+    const testPort = 21000 + slot;
+    // Probe configs contain the node's full credentials. They used to be
+    // written to /dev at the default umask (0644, world-traversable dir);
+    // they now live in the module's private tmpfs, 0600.
+    const tmpFile = `${STUB_DIR}/run/nodetest/${slot}.json`;
+    const rawConfigStr = _resolveXrayConfig(node.rawUri);
+    const xrayConfigObj = JSON.parse(rawConfigStr);
+    if (xrayConfigObj.error) throw new Error(xrayConfigObj.error);
+    // A plaintext VLESS node reaches its server through a loopback
+    // dokodemo-door tunnel (helper.js: applyPlainVlessLoopback). Keep those
+    // inbounds, but move them to this slot's own 127.18.<1+slot>.x block: the
+    // device-wide xray already listens on 127.18.0.x:80, and up to
+    // NODE_TEST_CONCURRENCY probes run at once.
+    relocatePlainVlessPool(xrayConfigObj, 1 + slot);
+    const plainTunnels = (Array.isArray(xrayConfigObj.inbounds) ? xrayConfigObj.inbounds : [])
+        .filter(i => i && typeof i.tag === 'string' && i.tag.indexOf(PLAIN_TUN_TAG_PREFIX) === 0);
+    xrayConfigObj.inbounds = [{
+        tag: "socks-test-in",
+        port: testPort,
+        listen: testIp,
+        protocol: "socks",
+        settings: { auth: "noauth", udp: true }
+    }, ...plainTunnels];
+    return { testIp, testPort, tmpFile, configB64: utoa(JSON.stringify(xrayConfigObj)) };
+}
+
+// Builds the probe script. The spawned xray is bounded three ways: an explicit
+// kill, a `trap` covering the abnormal-exit paths, and an outer `timeout` in
+// case the shell itself is torn down. Previously an interrupted probe left a
+// root xray running with the node's credentials in memory.
+function _buildProbeScript(tmpFile, configB64, innerCmd) {
+    return `
+        umask 077
+        mkdir -p ${shQuote(STUB_DIR + '/run/nodetest')} 2>/dev/null
+        chmod 700 ${shQuote(STUB_DIR + '/run/nodetest')} 2>/dev/null
+        XPID=""
+        cleanup() { [ -n "$XPID" ] && kill -9 "$XPID" 2>/dev/null; rm -f ${shQuote(tmpFile)}; }
+        trap cleanup EXIT HUP INT TERM
+        printf '%s' ${shQuote(configB64)} | base64 -d > ${shQuote(tmpFile)}
+        ${MODDIR}/bin/xray run -c ${shQuote(tmpFile)} >/dev/null 2>&1 &
+        XPID=$!
+        sleep 1
+        ${innerCmd}
+        cleanup
+        trap - EXIT
+        printf '%s' "$RES"
+    `;
+}
+
+function _setPingSpan(pingSpan, text, colorVar) {
+    if (!pingSpan) return;
+    pingSpan.innerText = text;
+    pingSpan.style.color = colorVar;
+}
+
+// Runs one probe against a node in an isolated xray instance.
+// `mode` is 'http' (latency in ms) or 'ip' (egress IP address).
+async function _execNodeProbe(node, pingSpan, mode) {
+    _setPingSpan(pingSpan, "...", "var(--text-muted)");
+
+    const slot = _acquireTestSlot();
+    if (slot === -1) {
+        _setPingSpan(pingSpan, "?", "var(--red, #ff1744)");
+        return;
+    }
+
+    try {
+        let built;
+        try {
+            built = _buildXrayTestInbound(node, slot);
+        } catch (e) {
+            _setPingSpan(pingSpan, "?", "var(--red, #ff1744)");
+            return;
+        }
+        const { testIp, testPort, tmpFile, configB64 } = built;
+
+        const innerCmd = mode === 'http'
+            ? `RES=$(${MODDIR}/bin/curl --socks5-hostname ${testIp}:${testPort} -s ` +
+              `-w "%{time_starttransfer}" --max-time 3 -o /dev/null ` +
+              `http://gstatic.com/generate_204 2>/dev/null)`
+            : `RES=$(${MODDIR}/bin/curl --socks5-hostname ${testIp}:${testPort} -s ` +
+              `--max-time 3 https://icanhazip.com 2>/dev/null)`;
+
+        // Hard ceiling on the whole probe so a wedged xray or curl cannot
+        // hold the slot — or a root process — indefinitely.
+        const output = await execShellAsync(
+            `timeout 15 sh -c ${shQuote(_buildProbeScript(tmpFile, configB64, innerCmd))}`
+        );
+
+        if (mode === 'http') {
+            const val = parseFloat(output.trim());
+            if (!isNaN(val) && val > 0) {
+                _setPingSpan(pingSpan, `${Math.round(val * 1000)}ms`, "var(--green, #00e676)");
+            } else {
+                _setPingSpan(pingSpan, "?", "var(--red, #ff1744)");
+            }
+        } else {
+            const ip = output.trim();
+            if (ip) {
+                _setPingSpan(pingSpan, ip, "var(--green, #00e676)");
+            } else {
+                _setPingSpan(pingSpan, "?", "var(--red, #ff1744)");
+            }
+        }
+    } finally {
+        _releaseTestSlot(slot);
+    }
+}
+
+
+async function _pingCategory(category, mode) {
+    const catData = profiles[category];
+    if (!catData || !catData.nodes || catData.nodes.length === 0) return;
+
+    await parallelWithLimit(catData.nodes.filter(n => !_isGroupNode(n)), NODE_TEST_CONCURRENCY, async (node) => {
+        const pingSpan = document.getElementById(`ping-${category}-${node.id}`);
+        await _execNodeProbe(node, pingSpan, mode);
+    });
+}
+
+const pingCategoryCheckHttp = (category) => _pingCategory(category, 'http');
+const pingCategoryCheckIp = (category) => _pingCategory(category, 'ip');
+
+// --- Single-node (per-config) HTTP / IP checks ---
+
+async function _checkSingleNode(category, nodeId, mode) {
+    const node = profiles[category]?.nodes?.find(n => n.id === nodeId);
+    if (!node) return;
+    const pingSpan = document.getElementById(`ping-${category}-${node.id}`);
+    await _execNodeProbe(node, pingSpan, mode);
+}
+
+const checkSingleNodeHttp = (category, nodeId) => _checkSingleNode(category, nodeId, 'http');
+const checkSingleNodeIp = (category, nodeId) => _checkSingleNode(category, nodeId, 'ip');
+
+async function checkHttpWithClose(event, category) {
+    showLoading(`${t("toast_check_http")}${category}...`);
+    const btn = event.currentTarget;
+    closeAllMenus();
+    btn.disabled = true;
+    await new Promise(r => setTimeout(r, 150));
+    try {
+        await pingCategoryCheckHttp(category);
+    } finally {
+        btn.disabled = false;
+        hideLoading();
+    }
+}
+
+async function checkIpWithClose(event, category) {
+    showLoading(`${t("toast_check_ip")}${category}...`);
+    const btn = event.currentTarget;
+    closeAllMenus();
+    btn.disabled = true;
+    await new Promise(r => setTimeout(r, 150));
+    try {
+        await pingCategoryCheckIp(category);
+    } finally {
+        btn.disabled = false;
+        hideLoading();
+    }
+}
+
+async function checkSingleHttpWithClose(event, category, nodeId) {
+    const catData = profiles[category];
+    const node = catData?.nodes?.find(n => n.id === nodeId);
+    showLoading(`${t("toast_check_http")}${node ? node.name : ''}...`);
+    const btn = event.currentTarget;
+    closeAllMenus();
+    btn.disabled = true;
+    await new Promise(r => setTimeout(r, 150));
+    try {
+        await checkSingleNodeHttp(category, nodeId);
+    } finally {
+        btn.disabled = false;
+        hideLoading();
+    }
+}
+
+async function checkSingleIpWithClose(event, category, nodeId) {
+    const catData = profiles[category];
+    const node = catData?.nodes?.find(n => n.id === nodeId);
+    showLoading(`${t("toast_check_ip")}${node ? node.name : ''}...`);
+    const btn = event.currentTarget;
+    closeAllMenus();
+    btn.disabled = true;
+    await new Promise(r => setTimeout(r, 150));
+    try {
+        await checkSingleNodeIp(category, nodeId);
+    } finally {
+        btn.disabled = false;
+        hideLoading();
+    }
+}
+
+async function parallelWithLimit(items, limit, fn) {
+    const promises = [];
+    const executing = new Set();
+    
+    for (const item of items) {
+        const p = Promise.resolve().then(() => fn(item));
+        promises.push(p);
+        executing.add(p);
+        
+        const clean = () => executing.delete(p);
+        p.then(clean, clean);
+        
+        if (executing.size >= limit) {
+            await Promise.race(executing);
+        }
+    }
+    return Promise.all(promises);
+}
+
+function _logClassifyLine(text) {
+    const t = text.toLowerCase();
+    if (/\berror\b/.test(t))   return 'error';
+    if (/\bwarning\b/.test(t)) return 'warning';
+    if (/\bdebug\b/.test(t))   return 'debug';
+    // Xray access log: looks like "2024/01/01 00:00:00 accepted tcp:..."
+    if (/accepted|rejected/.test(t)) return 'access';
+    return 'info';
+}
+
+function _logRenderLines() {
+    const output = document.getElementById('log-output');
+    const emptyState = document.getElementById('log-empty-state');
+    if (!output) return;
+
+    if (_logAllLines.length === 0) {
+        emptyState && (emptyState.style.display = '');
+        // clear existing line nodes
+        output.querySelectorAll('.log-line').forEach(el => el.remove());
+        document.getElementById('log-line-count').textContent = '— lines';
+        _logLineBase = 0;
+        return;
+    }
+
+    emptyState && (emptyState.style.display = 'none');
+
+    // Diff: only append new lines (avoid full re-render flicker)
+    const existingCount = output.querySelectorAll('.log-line').length;
+    const newLines = _logAllLines.slice(existingCount);
+
+    newLines.forEach((text, i) => {
+        const lineNum = _logLineBase + existingCount + i + 1;
+        const level = _logClassifyLine(text);
+        const div = document.createElement('div');
+        div.className = `log-line log-line--${level}${level === 'access' ? ' log-line--access' : ''}`;
+        div.dataset.level = level;
+
+        // apply current filter
+        if (_logCurrentFilter !== 'all' && _logCurrentFilter !== level) {
+            div.classList.add('log-hidden');
+        }
+
+        const numSpan = document.createElement('span');
+        numSpan.className = 'log-line-num';
+        numSpan.textContent = lineNum;
+
+        const txtSpan = document.createElement('span');
+        txtSpan.className = 'log-line-text';
+        txtSpan.textContent = text;
+
+        div.appendChild(numSpan);
+        div.appendChild(txtSpan);
+        output.appendChild(div);
+    });
+
+    // Update line count
+    const visibleCount = output.querySelectorAll('.log-line:not(.log-hidden)').length;
+    document.getElementById('log-line-count').textContent =
+        `${_logAllLines.length} lines${_logCurrentFilter !== 'all' ? ` (${visibleCount} shown)` : ''}`;
+
+    // Auto-scroll to bottom if tail mode is on
+    if (_logTailEnabled) {
+        output.scrollTop = output.scrollHeight;
+    }
+}
+
+// `logservice read -n N` always returns the LAST N lines, so once the log is
+// longer than N the window slides: old lines fall off the front while new ones
+// appear at the back. Returns how many lines to drop from the front of `oldL`
+// so that what remains is a prefix of `newL`, or -1 if they don't line up
+// (log flushed / xray restarted / window grew past what we have).
+function _logSlideOffset(oldL, newL) {
+    const n = oldL.length;
+    for (let k = 0; k < n; k++) {
+        const m = n - k;
+        if (m > newL.length || oldL[k] !== newL[0]) continue;
+        let ok = true;
+        for (let j = 1; j < m; j++) {
+            if (oldL[k + j] !== newL[j]) { ok = false; break; }
+        }
+        if (ok) return k;
+    }
+    return -1;
+}
+
+function refreshLog() {
+    const tailLines = document.getElementById('log-tail-lines')?.value || 200;
+    const btn = document.getElementById('btn-log-refresh');
+    btn && btn.querySelector('svg') && btn.classList.add('spinning');
+
+    const dot = document.getElementById('log-status-dot');
+
+    execShell(
+        `${MODDIR}/bin/xhuskydg_helper logservice read -c '${LOG_CTRL}' -n ${tailLines}`,
+        (output) => {
+            btn && btn.classList.remove('spinning');
+
+            if (!output || !output.trim()) {
+                _logAllLines = [];
+                _logRenderLines();
+                dot && dot.classList.remove('live');
+                return;
+            }
+
+            const newLines = output.split('\n').filter(l => l.length > 0);
+
+            // Reconcile with what's already on screen. The old code only
+            // appended lines past the current count, so with a full N-line
+            // window nothing new was ever rendered.
+            const logOut = document.getElementById('log-output');
+            const drop = _logSlideOffset(_logAllLines, newLines);
+            if (drop < 0) {
+                // No overlap: log flushed, xray restarted, or the window grew.
+                logOut?.querySelectorAll('.log-line').forEach(el => el.remove());
+                _logAllLines = [];
+                _logLineBase = 0;
+            } else if (drop > 0) {
+                // Window slid: drop the oldest `drop` lines from the top.
+                const nodes = logOut ? logOut.querySelectorAll('.log-line') : [];
+                for (let i = 0; i < drop && i < nodes.length; i++) nodes[i].remove();
+                _logAllLines = _logAllLines.slice(drop);
+                _logLineBase += drop;
+            }
+
+            _logAllLines = newLines;
+            _logRenderLines();
+            dot && dot.classList.add('live');
+        }
+    );
+}
+
+function startLogAutoRefresh() {
+    stopLogAutoRefresh();
+    refreshLog();
+    const isEnabled = document.getElementById('log-autorefresh-toggle')?.checked ?? false;
+    if (!isEnabled) return;
+    const interval = parseInt(document.getElementById('log-autorefresh-interval')?.value || 5000);
+    _logAutoRefreshTimer = setInterval(refreshLog, interval);
+}
+
+function stopLogAutoRefresh() {
+    if (_logAutoRefreshTimer) {
+        clearInterval(_logAutoRefreshTimer);
+        _logAutoRefreshTimer = null;
+    }
+    const dot = document.getElementById('log-status-dot');
+    dot && dot.classList.remove('live');
+}
+
+function toggleLogAutoRefresh() {
+    const isEnabled = document.getElementById('log-autorefresh-toggle')?.checked;
+    if (isEnabled) {
+        startLogAutoRefresh();
+    } else {
+        stopLogAutoRefresh();
+    }
+}
+
+function updateLogRefreshInterval() {
+    const isEnabled = document.getElementById('log-autorefresh-toggle')?.checked;
+    if (isEnabled) startLogAutoRefresh();
+}
+
+function toggleLogTail() {
+    _logTailEnabled = !_logTailEnabled;
+    const btn = document.getElementById('btn-log-tail');
+    if (btn) {
+        btn.dataset.active = _logTailEnabled ? 'true' : 'false';
+        btn.title = _logTailEnabled ? 'Auto-scroll ON' : 'Auto-scroll OFF';
+    }
+    if (_logTailEnabled) {
+        const output = document.getElementById('log-output');
+        output && (output.scrollTop = output.scrollHeight);
+    }
+}
+
+function changeLogFontSize(delta) {
+    _logFontSize = Math.min(24, Math.max(8, _logFontSize + delta));
+    const output = document.getElementById('log-output');
+    if (output) output.style.setProperty('--log-font-size', _logFontSize + 'px');
+    const label = document.getElementById('log-fontsize-value');
+    if (label) label.textContent = _logFontSize;
+}
+
+function toggleLogWrap() {
+    _logWrapEnabled = !_logWrapEnabled;
+    const output = document.getElementById('log-output');
+    if (output) output.classList.toggle('log-wrap', _logWrapEnabled);
+    const btn = document.getElementById('btn-log-wrap');
+    if (btn) {
+        btn.dataset.active = _logWrapEnabled ? 'true' : 'false';
+        btn.title = _logWrapEnabled ? 'Word wrap ON' : 'Word wrap OFF';
+    }
+}
+
+function setLogFilter(level) {
+    _logCurrentFilter = level;
+
+    // Update chip active state
+    document.querySelectorAll('.log-filter-chip').forEach(chip => {
+        chip.classList.toggle('active', chip.dataset.level === level);
+    });
+
+    // Show/hide lines
+    document.querySelectorAll('#log-output .log-line').forEach(line => {
+        const lineLevel = line.dataset.level;
+        if (level === 'all' || lineLevel === level) {
+            line.classList.remove('log-hidden');
+        } else {
+            line.classList.add('log-hidden');
+        }
+    });
+
+    // Update count
+    const total = _logAllLines.length;
+    const visible = document.querySelectorAll('#log-output .log-line:not(.log-hidden)').length;
+    const countEl = document.getElementById('log-line-count');
+    if (countEl) {
+        countEl.textContent = `${total} lines${level !== 'all' ? ` (${visible} shown)` : ''}`;
+    }
+}
+
+function clearLogView() {
+    execShell(`${MODDIR}/bin/xhuskydg_helper logservice flush -c '${LOG_CTRL}'`, () => {
+        _logAllLines = [];
+        _logLineBase = 0;
+        document.getElementById('log-output')?.querySelectorAll('.log-line')
+            .forEach(el => el.remove());
+        const emptyState = document.getElementById('log-empty-state');
+        emptyState && (emptyState.style.display = '');
+        document.getElementById('log-line-count').textContent = '— lines';
+        showToast(t('toast_log_cleared'), 'info');
+    });
+}
+
+function copyLogToClipboard() {
+    const text = _logAllLines.join('\n');
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+        showToast(t('toast_log_copied'), 'success');
+    }).catch(() => {
+        showToast(t('toast_log_copy_fail'), 'error');
+    });
+}
+
+/* ===== Network Latency Monitor ===== */
+
+function _isLatencyTabActive() {
+    return document.getElementById('tab-latency')?.classList.contains('active') === true;
+}
+
+// There is no on/off switch: the backend probe runs while the Latency tab is
+// visible and nowhere else (see switchTab, _resumeBackgroundWork and the
+// pagehide handler). Starting always restarts the backend loop from a clean
+// state, so a leftover probe from a previous visit can never be mistaken for
+// a live one.
+function startLatencyMonitor() {
+    execShell(`sh ${MODDIR}/proxy_control.sh start_monitor_latency`, () => {
+        // The user may have left the tab (or backgrounded the WebUI) while
+        // the exec was in flight. Don't poll then; with no heartbeat the
+        // backend loop ends by itself after LATENCY_HB_TIMEOUT.
+        if (!_isLatencyTabActive() || document.hidden) return;
+        _latencySamples = [];
+        renderLatencyChart();
+        updateLatencyStats();
+        startLatencyPolling();
+    });
+}
+
+function stopLatencyMonitor() {
+    stopLatencyPolling();
+    const dot = document.getElementById('latency-status-dot');
+    dot && dot.classList.remove('live');
+    renderNetworkInterfaceInfo('');
+    execShell(`sh ${MODDIR}/proxy_control.sh stop_monitor_latency`, () => {});
+}
+
+// Used when the WebUI comes back to the foreground while the Latency tab is
+// open: keep the running probe (and its chart) if the backend is still alive,
+// restart it if it timed out on the stale heartbeat while we were away.
+function syncLatencyMonitorState() {
+    execShell(`[ -f '${TIME_RES_FILE}' ] && echo 1 || echo 0`, (output) => {
+        if (!_isLatencyTabActive() || document.hidden) return;
+        if (output.trim() === '1') {
+            renderLatencyChart();
+            startLatencyPolling();
+        } else {
+            startLatencyMonitor();
+        }
+    });
+}
+
+function startLatencyPolling() {
+    stopLatencyPolling();
+    pollLatency();
+    _latencyPollTimer = setInterval(pollLatency, LATENCY_POLL_MS);
+}
+
+function stopLatencyPolling() {
+    if (_latencyPollTimer) {
+        clearInterval(_latencyPollTimer);
+        _latencyPollTimer = null;
+    }
+}
+
+const _LATENCY_ADDR_SPLIT_MARKER = '___ADDR_INFO_SPLIT___';
+
+function pollLatency() {
+    // One exec does all three jobs: refresh the liveness heartbeat, read the
+    // latest probe result, and read the interface address dump. Sending the
+    // heartbeat separately would have doubled the wakeup cost of polling.
+    execShell(
+        `[ -f ${shQuote(LATENCY_HB_FILE)} ] && date +%s > ${shQuote(LATENCY_HB_FILE)}; ` +
+        `cat ${shQuote(TIME_RES_FILE)} 2>/dev/null; ` +
+        `echo '${_LATENCY_ADDR_SPLIT_MARKER}'; ` +
+        `cat ${shQuote(ADDR_INFO_FILE)} 2>/dev/null`,
+        (output) => {
+            const dot = document.getElementById('latency-status-dot');
+            const parts = (output || '').split(_LATENCY_ADDR_SPLIT_MARKER);
+            const raw = (parts[0] || '').trim();
+            const addrRaw = parts[1] || '';
+            const num = parseFloat(raw);
+            // service.sh writes seconds (curl's %{time_starttransfer}); empty/0/NaN means
+            // the probe timed out or never completed within curl's --max-time window.
+            const ms = (raw !== '' && !isNaN(num) && num > 0) ? Math.round(num * 1000) : null;
+
+            _latencySamples.push({ ms });
+            if (_latencySamples.length > LATENCY_MAX_SAMPLES) {
+                _latencySamples.shift();
+            }
+
+            dot && dot.classList.add('live');
+            updateLatencyStats();
+            renderLatencyChart();
+            renderNetworkInterfaceInfo(addrRaw);
+        }
+    );
+}
+
+// Parses the `ip addr show <iface>` style dump written to ADDR_INFO_FILE.
+// Picks the interface name from the "N: name: <FLAGS> ..." header line,
+// the first global-scope IPv4 (`inet`), and the first global-scope IPv6
+// (`inet6 ... scope global`, skipping link-local `scope link` addresses).
+function parseAddrInfo(raw) {
+    const lines = (raw || '').split('\n');
+    let iface = null;
+    let ipv4 = null;
+    let ipv6 = null;
+
+    for (const line of lines) {
+        const headerMatch = line.match(/^\d+:\s+([^:@]+)[:@]/);
+        if (headerMatch && !iface) {
+            iface = headerMatch[1].trim();
+            continue;
+        }
+        const t = line.trim();
+        if (!ipv4) {
+            const m4 = t.match(/^inet\s+([\d.]+)\/\d+/);
+            if (m4) ipv4 = m4[1];
+        }
+        if (!ipv6) {
+            const m6 = t.match(/^inet6\s+([0-9a-fA-F:]+)\/\d+\s+scope\s+global/);
+            if (m6) ipv6 = m6[1];
+        }
+    }
+
+    return { iface, ipv4, ipv6 };
+}
+
+function renderNetworkInterfaceInfo(raw) {
+    const ifaceEl = document.getElementById('latency-iface-value');
+    const ipv4El = document.getElementById('latency-ipv4-value');
+    const ipv6El = document.getElementById('latency-ipv6-value');
+    if (!ifaceEl && !ipv4El && !ipv6El) return;
+
+    const { iface, ipv4, ipv6 } = parseAddrInfo(raw);
+    const none = t('latency_net_none');
+
+    ifaceEl && (ifaceEl.textContent = iface || none);
+    ipv4El && (ipv4El.textContent = ipv4 || none);
+    ipv6El && (ipv6El.textContent = ipv6 || none);
+}
+
+/* ===== Mobile IP Hunter ===== */
+
+// Keeps only well-formed IPv4 prefix octets (1-4 dot-separated groups),
+// dropping anything else typed into the field, then rejoins with ';'
+// to match the format the hunter script expects (e.g. "10.120;10.121").
+function sanitizeIpHunterPrefixes(raw) {
+    return (raw || '')
+        .split(/[;,\s]+/)
+        .map(p => p.trim())
+        .filter(p => /^\d{1,3}(\.\d{1,3}){0,3}$/.test(p))
+        .join(';');
+}
+
+// Reflects real backend state by checking for the existence of IP_HUNT_FILE,
+// same approach as syncLatencyMonitorState, so the toggle and field stay
+// correct across tab switches / page reloads.
+function syncIpHunterState() {
+    execShell(
+        `if [ -f '${IP_HUNT_FILE}' ]; then echo 1; cat '${IP_HUNT_FILE}'; else echo 0; fi`,
+        (output) => {
+            const toggle = document.getElementById('ip-hunter-toggle');
+            const input = document.getElementById('ip-hunter-prefixes');
+            const lines = (output || '').split('\n');
+            const enabled = lines[0].trim() === '1';
+            const content = lines.slice(1).join('\n').trim();
+
+            if (toggle) toggle.checked = enabled;
+            if (input) {
+                input.value = content;
+            }
+        }
+    );
+}
+
+function toggleIpHunter() {
+    const toggle = document.getElementById('ip-hunter-toggle');
+    const enabled = !!toggle?.checked;
+
+    if (enabled) {
+        saveIpHunterPrefixes();
+        toggleService('reset_mobile_network');
+    } else {
+        execShell(`rm -f '${IP_HUNT_FILE}'`, () => {
+            showToast(t('toast_ip_hunter_disabled'), 'info');
+        });
+    }
+}
+
+function onIpHunterInputChange() {
+    const toggle = document.getElementById('ip-hunter-toggle');
+    if (!toggle?.checked) return;
+
+    if (_ipHunterSaveTimer) clearTimeout(_ipHunterSaveTimer);
+    _ipHunterSaveTimer = setTimeout(saveIpHunterPrefixes, 600);
+}
+
+function saveIpHunterPrefixes() {
+    const input = document.getElementById('ip-hunter-prefixes');
+    const sanitized = sanitizeIpHunterPrefixes(input?.value || '');
+    if (input) input.value = sanitized;
+
+    if (!sanitized) {
+        showToast(t('toast_ip_hunter_invalid'), 'error');
+        return;
+    }
+
+    execShell(`mkdir -p ${shQuote(DATADIR)} && chmod 700 ${shQuote(DATADIR)}`, () => {
+        writeFileB64(IP_HUNT_FILE, sanitized, () => {
+            showToast(t('toast_ip_hunter_saved'), 'success');
+        });
+    });
+}
+
+function updateLatencyStats() {
+    const last = _latencySamples[_latencySamples.length - 1];
+    const valueEl = document.getElementById('latency-current-value');
+    if (valueEl) {
+        const hasLast = last && last.ms !== null;
+        valueEl.textContent = hasLast ? `${last.ms} ms` : (last ? t('latency_timeout_label') : '— ms');
+        valueEl.classList.toggle('latency-current-value--timeout', !!last && !hasLast);
+    }
+
+    const valid = _latencySamples.filter(s => s.ms !== null).map(s => s.ms);
+    const lossPct = _latencySamples.length
+        ? Math.round(((_latencySamples.length - valid.length) / _latencySamples.length) * 100)
+        : 0;
+
+    const avgEl = document.getElementById('latency-stat-avg');
+    const minEl = document.getElementById('latency-stat-min');
+    const maxEl = document.getElementById('latency-stat-max');
+    const lossEl = document.getElementById('latency-stat-loss');
+
+    avgEl && (avgEl.textContent = valid.length ? `${Math.round(valid.reduce((a, b) => a + b, 0) / valid.length)} ms` : '—');
+    minEl && (minEl.textContent = valid.length ? `${Math.min(...valid)} ms` : '—');
+    maxEl && (maxEl.textContent = valid.length ? `${Math.max(...valid)} ms` : '—');
+    lossEl && (lossEl.textContent = _latencySamples.length ? `${lossPct}%` : '—');
+}
+
+function renderLatencyChart() {
+    const svg = document.getElementById('latency-chart-svg');
+    const emptyState = document.getElementById('latency-empty-state');
+    if (!svg) return;
+
+    if (_latencySamples.length === 0) {
+        svg.innerHTML = '';
+        emptyState && (emptyState.style.display = '');
+        return;
+    }
+    emptyState && (emptyState.style.display = 'none');
+
+    const wrap = document.getElementById('latency-chart-wrap');
+    const width = Math.max(wrap ? wrap.clientWidth : 600, 100);
+    const height = 200;
+    const pad = 10;
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+    const n = LATENCY_MAX_SAMPLES;
+    const slotW = (width - pad * 2) / Math.max(n - 1, 1);
+    const validValues = _latencySamples.filter(s => s.ms !== null).map(s => s.ms);
+    const dataMax = validValues.length ? Math.max(...validValues) : 300;
+    const chartMax = Math.max(3000, Math.ceil((dataMax * 1.25) / 100) * 100);
+    const top = pad;
+    const bottom = height - pad;
+    const usableH = bottom - top;
+    const yFor = (ms) => bottom - (Math.min(ms, chartMax) / chartMax) * usableH;
+
+    const parts = [];
+
+    // Gridlines + scale labels
+    [0, 0.5, 1].forEach((f) => {
+        const y = bottom - f * usableH;
+        parts.push(`<line x1="${pad}" y1="${y}" x2="${width - pad}" y2="${y}" stroke="var(--md-outline-variant)" stroke-width="1" stroke-dasharray="3,4"/>`);
+        parts.push(`<text x="${pad + 4}" y="${Math.max(y - 4, 10)}" font-size="10" fill="var(--md-on-surface-variant)" font-family="var(--md-font-mono)">${Math.round(f * chartMax)}ms</text>`);
+    });
+
+    // Green line segments for successful samples, red bands for timeouts
+    let linePoints = [];
+    const flushLine = () => {
+        if (linePoints.length > 1) {
+            parts.push(`<polyline points="${linePoints.join(' ')}" fill="none" stroke="var(--md-success)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`);
+        } else if (linePoints.length === 1) {
+            const [x, y] = linePoints[0].split(',');
+            parts.push(`<circle cx="${x}" cy="${y}" r="2.5" fill="var(--md-success)"/>`);
+        }
+        linePoints = [];
+    };
+
+    _latencySamples.forEach((s, i) => {
+        const x = pad + i * slotW;
+        if (s.ms === null) {
+            flushLine();
+            const bandW = Math.max(slotW, 3);
+            parts.push(`<rect x="${x - bandW / 2}" y="${top}" width="${bandW}" height="${usableH}" fill="var(--md-error)" opacity="0.28"/>`);
+        } else {
+            linePoints.push(`${x},${yFor(s.ms)}`);
+        }
+    });
+    flushLine();
+
+    // Highlight the most recent successful sample
+    for (let i = _latencySamples.length - 1; i >= 0; i--) {
+        if (_latencySamples[i].ms !== null) {
+            const x = pad + i * slotW;
+            const y = yFor(_latencySamples[i].ms);
+            parts.push(`<circle cx="${x}" cy="${y}" r="3.5" fill="var(--md-success)" stroke="var(--md-surface)" stroke-width="1.5"/>`);
+            break;
+        }
+    }
+
+    svg.innerHTML = parts.join('');
+}
+
+// ===============================================================
+// Custom Hosts tab
+// ===============================================================
+// HOSTS_FILE is read once (a plain `cat`, done in loadState) and parsed
+// into `hostsEntries` entirely in JavaScript (parseHostsEntries, in
+// helper.js) — no awk/sed/grep/sort on the shell side for reading OR
+// writing. Every add/edit/delete updates `hostsEntries` in memory, then
+// writes the re-serialized text back with one writeFileB64() call.
+//
+// The list itself still only ever renders the current page's ~40 rows to
+// the DOM as the user scrolls — that's the part that actually mattered for
+// not freezing the WebView on a large file; holding the parsed array in
+// JS memory costs nothing by comparison.
+
+// Ensures HOSTS_FILE exists and is in the standard format, migrating
+// whatever was there before. Sets the global `hostsEntries` /
+// `hostsFileText` and hands the final text to `callback`.
+function initHostsFileIfNeeded(rawFromDisk, callback) {
+    const text = rawFromDisk || '';
+    const alreadyStandard = text.split('\n')[0] === HOSTS_HEADER_TEXT.split('\n')[0];
+
+    // Real "ip host..." lines parse straight away, regardless of format.
+    const entries = parseHostsEntries(text);
+
+    if (!alreadyStandard) {
+        // Anything left over is either the earlier app-only format
+        // ("domain ip1,ip2,ip3") or a hand-written file predating the
+        // header — pick up whatever comma/space-separated IP lists follow
+        // a non-IP first token.
+        text.split(/\r?\n/).forEach(rawLine => {
+            const line = rawLine.replace(/#.*/, '').trim();
+            if (!line) return;
+            const parts = line.split(/\s+/).filter(Boolean);
+            if (parts.length < 2 || isIpAddr(parts[0])) return; // real lines already parsed above
+            const domain = normalizeHostKey(parts[0]);
+            if (!domain) return;
+            const ips = parts.slice(1).join(' ').split(/[\s,]+/).filter(isIpAddr);
+            if (!ips.length) return;
+            const existing = entries.find(e => e.domain === domain);
+            if (existing) ips.forEach(ip => { if (!existing.ips.includes(ip)) existing.ips.push(ip); });
+            else entries.push({ domain, ips });
+        });
+
+        // A legacy settings.customHosts value (pre-tab, stored in
+        // settings.base64) only matters when nothing else was found.
+        if (!entries.length && advSettings && advSettings.customHosts) {
+            const { hosts } = parseCustomHosts(advSettings.customHosts);
+            Object.entries(hosts).forEach(([domain, value]) => {
+                if (Array.isArray(value)) entries.push({ domain, ips: value.filter(isIpAddr) });
+            });
+        }
+    }
+
+    if (advSettings && advSettings.customHosts) {
+        delete advSettings.customHosts;
+        writeFileB64(SETTINGS_FILE, utoa(JSON.stringify(advSettings)), () => {});
+    }
+
+    entries.sort((a, b) => a.domain.localeCompare(b.domain));
+    const finalText = serializeHostsFile(entries);
+    hostsEntries = entries;
+
+    if (finalText === text) {
+        callback(finalText);
+        return;
+    }
+    writeFileB64(HOSTS_FILE, finalText, () => callback(finalText));
+}
+
+// Re-serializes `hostsEntries` and writes it — the single write path used
+// by every add/edit/delete below.
+function persistHostsEntries(callback) {
+    const text = serializeHostsFile(hostsEntries);
+    hostsFileText = text;
+    writeFileB64(HOSTS_FILE, text, callback);
+}
+
+// Re-reads HOSTS_FILE from disk and pushes it into config.json — for when
+// the file was replaced or edited outside the app (file explorer, adb, ...).
+// Everything else in this tab works off the in-memory copy, so without this
+// the app would keep showing (and later overwrite with) the stale entries.
+function reloadHostsFile() {
+    const btn = document.getElementById('btn-hosts-reload');
+    if (btn) btn.disabled = true;
+    const done = () => { if (btn) btn.disabled = false; };
+
+    execShell(`cat ${shQuote(HOSTS_FILE)} 2>/dev/null || echo ''`, (raw) => {
+        // Same parse/normalize path as at startup: real "ip host..." lines
+        // are picked up, and the file is rewritten under the standard header.
+        initHostsFileIfNeeded(raw || '', (finalText) => {
+            hostsFileText = finalText;
+            loadHostsDomainList();
+
+            const count = hostsEntries.length;
+            // Professional mode uses config.json verbatim, so dns.hosts is
+            // not generated and there is nothing to regenerate.
+            if (advSettings.proMode) {
+                done();
+                showToast(t('toast_hosts_reloaded_pro', { count }), 'success');
+                return;
+            }
+            applyActiveConfig({
+                onDone: (ok) => {
+                    done();
+                    if (ok) showToast(t('toast_hosts_reloaded', { count }), 'success');
+                }
+            });
+        });
+    });
+}
+
+function resetHostsList() {
+    _hostsLoadedCount = 0;
+    _hostsListEndReached = false;
+    const container = document.getElementById('hosts-list-container');
+    if (container) container.innerHTML = '';
+    updateHostsEmptyState();
+}
+
+function onHostsTabOpened() {
+    document.getElementById('hosts-search-input').value = '';
+    _hostsSearchQuery = '';
+    loadHostsDomainList();
+}
+
+function onHostsSearchInput() {
+    const input = document.getElementById('hosts-search-input');
+    if (_hostsSearchTimer) clearTimeout(_hostsSearchTimer);
+    _hostsSearchTimer = setTimeout(() => {
+        _hostsSearchQuery = (input ? input.value : '').trim();
+        loadHostsDomainList();
+    }, 300);
+}
+
+// Filters the in-memory `hostsEntries` for the current search query and
+// renders the first page. Pure JS and synchronous — no disk/shell
+// round-trip needed to browse or search the list.
+function loadHostsDomainList() {
+    resetHostsList();
+    const q = _hostsSearchQuery.toLowerCase();
+    _hostsFilteredEntries = q
+        ? hostsEntries.filter(e => e.domain.toLowerCase().includes(q) || e.ips.some(ip => ip.includes(q)))
+        : hostsEntries;
+    loadHostsPage();
+}
+
+function onHostsListScroll() {
+    const container = document.getElementById('hosts-list-container');
+    if (!container) return;
+    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 120) {
+        loadHostsPage();
+    }
+}
+
+function updateHostsEmptyState() {
+    const empty = document.getElementById('hosts-empty-state');
+    if (!empty) return;
+    empty.style.display = (_hostsFilteredEntries.length === 0) ? 'block' : 'none';
+}
+
+// Appends the next page of already-filtered entries to the DOM. This is
+// the only part that stays "lazy": the data is all in memory, but the DOM
+// only ever holds the rows the user has scrolled to.
+function loadHostsPage() {
+    if (_hostsListEndReached) return;
+    const pageEntries = _hostsFilteredEntries.slice(_hostsLoadedCount, _hostsLoadedCount + HOSTS_PAGE_SIZE);
+    updateHostsEmptyState();
+    if (!pageEntries.length) {
+        _hostsListEndReached = true;
+        return;
+    }
+    renderHostsPage(pageEntries);
+    _hostsLoadedCount += pageEntries.length;
+    if (_hostsLoadedCount >= _hostsFilteredEntries.length) _hostsListEndReached = true;
+}
+
+function renderHostsPage(entries) {
+    const container = document.getElementById('hosts-list-container');
+    if (!container) return;
+    entries.forEach(e => container.appendChild(buildHostRowEl(e.domain, e.ips)));
+}
+
+function buildHostRowEl(domain, ips) {
+    const row = document.createElement('div');
+    row.className = 'hosts-row';
+    row.dataset.domain = domain;
+
+    const info = document.createElement('div');
+    info.className = 'hosts-row-info';
+    info.onclick = () => openEditHostModal(domain, ips);
+
+    const domainEl = document.createElement('div');
+    domainEl.className = 'hosts-row-domain';
+    domainEl.textContent = domain;
+    info.appendChild(domainEl);
+
+    const valuesEl = document.createElement('div');
+    valuesEl.className = 'hosts-row-values';
+    ips.forEach(ip => {
+        const chip = document.createElement('span');
+        chip.className = 'hosts-ip-chip';
+        chip.textContent = ip;
+        valuesEl.appendChild(chip);
+    });
+    info.appendChild(valuesEl);
+    row.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'hosts-row-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'hosts-row-icon-btn';
+    editBtn.title = t('menu_edit');
+    editBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
+    editBtn.onclick = (e) => { e.stopPropagation(); openEditHostModal(domain, ips); };
+    actions.appendChild(editBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'hosts-row-icon-btn btn-delete-item';
+    delBtn.title = t('btn_delete');
+    delBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+    delBtn.onclick = (e) => { e.stopPropagation(); deleteHostEntry(domain); };
+    actions.appendChild(delBtn);
+
+    row.appendChild(actions);
+    return row;
+}
+
+function openAddHostModal() {
+    currentEditingHostDomain = null;
+    document.getElementById('hosts-modal-title').innerHTML = t('modal_add_host_title');
+    const domainInput = document.getElementById('host-domain-input');
+    domainInput.value = '';
+    domainInput.disabled = false;
+    document.getElementById('host-ips-input').value = '';
+    document.getElementById('hosts-modal').style.display = 'block';
+}
+
+// The row already carries this domain's IPs (they came from `hostsEntries`
+// in memory), so editing needs no disk/shell round-trip.
+function openEditHostModal(domain, ips) {
+    currentEditingHostDomain = domain;
+    document.getElementById('hosts-modal-title').innerHTML = t('modal_edit_host_title');
+    const domainInput = document.getElementById('host-domain-input');
+    domainInput.value = domain;
+    domainInput.disabled = true;
+    document.getElementById('host-ips-input').value = (ips || []).join(', ');
+    document.getElementById('hosts-modal').style.display = 'block';
+}
+
+function closeHostModal() {
+    document.getElementById('hosts-modal').style.display = 'none';
+    currentEditingHostDomain = null;
+}
+
+function saveHostEntry() {
+    const domainRaw = document.getElementById('host-domain-input').value.trim();
+    const ipsRaw = document.getElementById('host-ips-input').value.trim();
+    const domain = normalizeHostKey(domainRaw);
+    const ips = [...new Set(ipsRaw.split(/[\s,]+/).map(s => s.trim()).filter(Boolean))];
+
+    if (!domain || !ips.length || ips.some(ip => !isIpAddr(ip))) {
+        showToast(t('toast_host_needs_fields'), 'error');
+        return;
+    }
+
+    // Replace (or add) this domain's entry and re-sort — plain array work
+    // in JS; the shell is only used to write the resulting text out.
+    hostsEntries = hostsEntries.filter(e => e.domain !== domain);
+    hostsEntries.push({ domain, ips });
+    hostsEntries.sort((a, b) => a.domain.localeCompare(b.domain));
+
+    persistHostsEntries(() => {
+        closeHostModal();
+        loadHostsDomainList();
+        applyActiveConfig();
+        showToast(t('toast_host_saved'), 'success');
+    });
+}
+
+async function deleteHostEntry(domain) {
+    const ok = await showConfirm(t('confirm_delete_host', { domain }));
+    if (!ok) return;
+    hostsEntries = hostsEntries.filter(e => e.domain !== domain);
+    persistHostsEntries(() => {
+        loadHostsDomainList();
+        applyActiveConfig();
+        showToast(t('toast_host_deleted'), 'success');
+    });
+}
+
+
+// ===== Categories: create empty ones, move nodes between them =====
+//
+// A category is just profiles[name]. Subscriptions create one with a url;
+// "Add category" creates one with no url and custom:true, which keeps it
+// visible while it is empty. Names may not contain ':' because activeConfig
+// is stored as "category:id" and split on it.
+
+function _validCategoryName(name) {
+    return !!name && name.indexOf(':') === -1;
+}
+
+function openAddCategoryModal() {
+    document.getElementById('add-category-name').value = '';
+    document.getElementById('add-category-modal').style.display = 'block';
+    setTimeout(() => document.getElementById('add-category-name').focus(), 50);
+}
+
+function closeAddCategoryModal() {
+    document.getElementById('add-category-modal').style.display = 'none';
+}
+
+function saveNewCategory() {
+    const name = document.getElementById('add-category-name').value.trim();
+    if (!_validCategoryName(name)) return showToast(t('toast_category_bad_name'), 'error');
+    if (profiles[name]) return showToast(t('toast_category_exists'), 'error');
+    profiles[name] = { url: null, nodes: [], custom: true };
+    categoryExpandedState[name] = true;
+    saveProfiles();
+    closeAddCategoryModal();
+    renderProfiles();
+    showToast(t('toast_category_created', { name }), 'success');
+}
+
+let _movingNode = null; // { category, id }
+
+function openMoveNodeModal(event, category, id) {
+    event.stopPropagation();
+    closeAllMenus();
+    if (!profiles[category]?.nodes?.some(n => n.id === id)) return;
+    _movingNode = { category, id };
+
+    const sel = document.getElementById('move-node-target');
+    sel.innerHTML = '';
+    Object.keys(profiles).forEach(c => {
+        if (c === category) return;
+        const o = document.createElement('option');
+        o.value = c;
+        o.textContent = c;
+        sel.appendChild(o);
+    });
+    document.getElementById('move-node-newcat').value = '';
+    document.getElementById('move-node-modal').style.display = 'block';
+}
+
+function closeMoveNodeModal() {
+    document.getElementById('move-node-modal').style.display = 'none';
+    _movingNode = null;
+}
+
+function confirmMoveNode() {
+    if (!_movingNode) return;
+    const { category, id } = _movingNode;
+    const src = profiles[category];
+    const idx = src ? src.nodes.findIndex(n => n.id === id) : -1;
+    if (idx === -1) return closeMoveNodeModal();
+
+    const newCat = document.getElementById('move-node-newcat').value.trim();
+    const dest = newCat || document.getElementById('move-node-target').value;
+    if (!dest || dest === category) return closeMoveNodeModal();
+    if (newCat && !_validCategoryName(newCat)) return showToast(t('toast_category_bad_name'), 'error');
+
+    if (!profiles[dest]) profiles[dest] = { url: null, nodes: [], custom: true };
+    const node = src.nodes[idx];
+    const wasActive = activeConfig === `${category}:${id}`;
+    // Node ids are only unique within a category.
+    if (profiles[dest].nodes.some(n => n.id === node.id)) {
+        node.id = Math.random().toString(36).substr(2, 9);
+        if (_isGroupNode(node)) node.rawUri = 'pgroup://' + node.id;
+    }
+    src.nodes.splice(idx, 1);
+    profiles[dest].nodes.push(node);
+    categoryExpandedState[dest] = true;
+
+    if (wasActive) {
+        activeConfig = `${dest}:${node.id}`;
+        saveActiveConfig();
+    }
+    saveProfiles();
+    closeMoveNodeModal();
+    renderProfiles();
+    showToast(t('toast_node_moved', { cat: dest }), 'success');
+    _refreshIfPolicyGroupsUsed();
+}
+
+// ===== Policy groups (routing.balancers) =====
+//
+// A policy group is an ordinary node that lives inside a category:
+//   { id, name, protocol: 'policygroup', rawUri: 'pgroup://<id>',
+//     pg: { type, source, filter } }
+//   pg.type    random | roundRobin | leastPing | leastLoad (Xray strategy)
+//   pg.source  '' = nodes from every category, otherwise one category name
+//   pg.filter  case-insensitive regex tested against each node's remark
+// It is selected, moved, renamed and deleted like any node. Membership is
+// evaluated every time the config is generated, so new subscription nodes that
+// match the filter join automatically. The id doubles as the group id used in
+// xray tags and in routing rules ("group:<id>").
+
+const POLICY_GROUP_TYPE_KEYS = {
+    random: 'pg_type_random',
+    roundRobin: 'pg_type_roundRobin',
+    leastPing: 'pg_type_leastPing',
+    leastLoad: 'pg_type_leastLoad'
+};
+let currentEditingGroupId = null;
+
+function _isGroupNode(n) {
+    return !!n && typeof n.rawUri === 'string' && n.rawUri.indexOf('pgroup://') === 0 && !!n.pg;
+}
+
+function _toGroup(cat, n) {
+    return {
+        id: n.id, name: n.name, container: cat,
+        type: n.pg.type, category: n.pg.source || '', filter: n.pg.filter || ''
+    };
+}
+
+function _allPolicyGroups() {
+    const out = [];
+    Object.keys(profiles).forEach(c => {
+        (profiles[c]?.nodes || []).forEach(n => { if (_isGroupNode(n)) out.push(_toGroup(c, n)); });
+    });
+    return out;
+}
+
+function _findPolicyGroup(id) {
+    return _allPolicyGroups().find(g => g.id === id) || null;
+}
+
+function _policyGroupMeta(g) {
+    const parts = [t(POLICY_GROUP_TYPE_KEYS[g.type] || 'pg_type_random'), g.category || t('opt_pg_all')];
+    if ((g.filter || '').trim()) parts.push(`/${g.filter.trim()}/i`);
+    parts.push(t('pg_nodes_count', { count: _policyGroupNodes(g).length }));
+    return '⚖ ' + parts.join(' | ');
+}
+
+// Groups created by the earlier version were kept in advSettings.policyGroups;
+// move them into the Manual category as normal nodes.
+function _migrateLegacyPolicyGroups() {
+    const legacy = advSettings.policyGroups;
+    if (!Array.isArray(legacy) || legacy.length === 0) return;
+    if (!profiles['Manual']) profiles['Manual'] = { url: null, nodes: [] };
+    legacy.forEach(g => {
+        if (!g || !g.id) return;
+        profiles['Manual'].nodes.push({
+            id: g.id, name: g.name, protocol: 'policygroup', address: '', port: '',
+            rawUri: 'pgroup://' + g.id,
+            pg: { type: g.type, source: g.category || '', filter: g.filter || '' }
+        });
+    });
+    advSettings.policyGroups = [];
+    saveProfiles();
+    persistRoutingRules();
+}
+
+// Saved nodes that belong to `group` right now (de-duplicated by rawUri,
+// because a node can sit in two categories after a subscription reload).
+function _policyGroupNodes(group) {
+    let re = null;
+    const f = (group.filter || '').trim();
+    if (f) {
+        try { re = new RegExp(f, 'i'); } catch (e) { return []; }
+    }
+    const cats = group.category
+        ? (profiles[group.category] ? [group.category] : [])
+        : Object.keys(profiles);
+    const seen = new Set();
+    const out = [];
+    cats.forEach(c => {
+        (profiles[c]?.nodes || []).forEach(n => {
+            if (!n || !n.rawUri || _isGroupNode(n) || seen.has(n.rawUri)) return;
+            if (re && !re.test(_nodeRemark(n))) return;
+            seen.add(n.rawUri);
+            out.push(n);
+        });
+    });
+    return out;
+}
+
+function _enabledGroupRuleIds() {
+    const ids = new Set();
+    (advSettings.routingRules || []).forEach(r => {
+        if (!r || r.enabled === false) return;
+        const tag = r.outboundTag || '';
+        if (tag.indexOf(POLICY_GROUP_PREFIX) === 0) ids.add(tag.slice(POLICY_GROUP_PREFIX.length));
+    });
+    return ids;
+}
+
+// Only groups that an enabled rule (or the active node) uses are sent to
+// helper.js, so unused groups cost nothing in config.json.
+function _collectPolicyGroupsResolved(alsoId) {
+    const wanted = _enabledGroupRuleIds();
+    if (alsoId) wanted.add(alsoId);
+    if (wanted.size === 0) return [];
+    return _allPolicyGroups()
+        .filter(g => wanted.has(g.id))
+        .map(g => ({ id: g.id, type: g.type, uris: _policyGroupNodes(g).map(n => n.rawUri) }));
+}
+
+function _activeIsGroup() {
+    if (!activeConfig) return false;
+    const i = activeConfig.indexOf(':');
+    const n = profiles[activeConfig.slice(0, i)]?.nodes?.find(x => x.id === activeConfig.slice(i + 1));
+    return _isGroupNode(n);
+}
+
+// Node membership changed (delete / move / category removed / reload): if the
+// active node or a rule depends on a group, regenerate the config.
+function _refreshIfPolicyGroupsUsed() {
+    if (_allPolicyGroups().length === 0) return;
+    if (_activeIsGroup() || _enabledGroupRuleIds().size > 0) applyActiveConfig();
+}
+
+function openPolicyGroupModal(id) {
+    const g = id ? _findPolicyGroup(id) : null;
+    currentEditingGroupId = g ? g.id : null;
+
+    const title = document.getElementById('pg-modal-title');
+    const key = g ? 'modal_edit_pg_title' : 'modal_add_pg_title';
+    title.setAttribute('data-i18n', key);
+    title.textContent = t(key);
+
+    document.getElementById('pg-name').value = g ? g.name : '';
+    document.getElementById('pg-type').value = g && POLICY_GROUP_TYPE_KEYS[g.type] ? g.type : 'leastPing';
+    document.getElementById('pg-filter').value = g ? (g.filter || '') : '';
+
+    // Which category the group itself is saved in (new groups only; an
+    // existing one is relocated with "Move to category").
+    const cont = document.getElementById('pg-container');
+    cont.innerHTML = '';
+    const cats = Object.keys(profiles);
+    if (!cats.includes('Manual')) cats.unshift('Manual');
+    cats.forEach(c => {
+        const o = document.createElement('option');
+        o.value = c;
+        o.textContent = c;
+        cont.appendChild(o);
+    });
+    cont.value = g ? g.container : (cats.includes('Manual') ? 'Manual' : cats[0]);
+    document.getElementById('pg-container-field').style.display = g ? 'none' : '';
+
+    const sel = document.getElementById('pg-category');
+    sel.innerHTML = '';
+    const all = document.createElement('option');
+    all.value = '';
+    all.textContent = t('opt_pg_all');
+    sel.appendChild(all);
+    Object.keys(profiles).forEach(c => {
+        const o = document.createElement('option');
+        o.value = c;
+        o.textContent = c;
+        sel.appendChild(o);
+    });
+    // Keep a deleted source category visible instead of silently turning the
+    // group into "all categories".
+    if (g && g.category && !profiles[g.category]) {
+        const o = document.createElement('option');
+        o.value = g.category;
+        o.textContent = g.category;
+        sel.appendChild(o);
+    }
+    sel.value = g ? (g.category || '') : '';
+
+    document.getElementById('policy-group-modal').style.display = 'block';
+}
+
+function closePolicyGroupModal() {
+    document.getElementById('policy-group-modal').style.display = 'none';
+    currentEditingGroupId = null;
+}
+
+function savePolicyGroup() {
+    const name = document.getElementById('pg-name').value.trim();
+    const type = document.getElementById('pg-type').value;
+    const source = document.getElementById('pg-category').value;
+    const filter = document.getElementById('pg-filter').value.trim();
+
+    if (!name) return showToast(t('toast_pg_name_required'), 'error');
+    if (!POLICY_GROUP_TYPE_KEYS[type]) return;
+    if (filter) {
+        try { new RegExp(filter, 'i'); } catch (e) {
+            return showToast(t('toast_pg_bad_regex'), 'error');
+        }
+    }
+    if (_allPolicyGroups().some(g => g.name === name && g.id !== currentEditingGroupId)) {
+        return showToast(t('toast_pg_name_exists'), 'error');
+    }
+
+    let activeAffected = false;
+    if (currentEditingGroupId) {
+        const g = _findPolicyGroup(currentEditingGroupId);
+        const node = g && profiles[g.container].nodes.find(n => n.id === g.id);
+        if (!node) return;
+        node.name = name;
+        node.pg = { type, source, filter };
+        activeAffected = activeConfig === `${g.container}:${g.id}`;
+    } else {
+        const dest = document.getElementById('pg-container').value || 'Manual';
+        if (!profiles[dest]) profiles[dest] = { url: null, nodes: [] };
+        // The id goes into xray tags/selectors, so keep it [a-z0-9] only and
+        // unique within the destination category.
+        let id;
+        do { id = 'g' + Math.random().toString(36).slice(2, 8); }
+        while (profiles[dest].nodes.some(n => n.id === id));
+        profiles[dest].nodes.push({
+            id, name, protocol: 'policygroup', address: '', port: '',
+            rawUri: 'pgroup://' + id, pg: { type, source, filter }
+        });
+        categoryExpandedState[dest] = true;
+    }
+
+    saveProfiles();
+    closePolicyGroupModal();
+    renderProfiles();
+    showToast(t('toast_pg_saved'), 'success');
+    if (activeAffected || _enabledGroupRuleIds().size > 0) applyActiveConfig();
+}
